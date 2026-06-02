@@ -1,0 +1,33 @@
+libgunwinder
+Copyright (C) 2025-2026 ByteDance
+
+Unless a file states otherwise, libgunwinder is licensed under the GNU
+Lesser General Public License version 3 or later (LGPL-3.0-or-later).
+
+The full LGPLv3 license text is provided in LICENSE and COPYING.LESSER.
+The GPLv3 base license text required for LGPLv3 distribution is provided
+in COPYING.
+
+Third-party acknowledgements:
+
+- uthash
+
+  This repository vendors include/uthash.h and include/utlist.h from
+  uthash by Troy D. Hanson. Those headers retain their original BSD-style
+  copyright and license notices.
+
+- elfutils
+
+  libgunwinder links against elfutils libraries including libelf and libdw.
+  Parts of libgunwinder's DWARF and stack unwinding behavior were developed
+  with conceptual guidance from elfutils/libdw and cross-checked against
+  libdw behavior. libgunwinder keeps its own data structures, parser/cache
+  layout, and stack-snapshot unwind flow. elfutils libraries and backends are
+  available under the
+  GPL-2.0-or-later / LGPL-3.0-or-later dual license option; libgunwinder
+  uses LGPL-3.0-or-later to align with that LGPL option.
+
+  No elfutils source files are vendored or copied in this repository. If future
+  changes import or adapt elfutils source code, keep the relevant file-level
+  copyright and license notices and reassess the license obligations for
+  those files.
