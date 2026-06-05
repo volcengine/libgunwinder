@@ -38,6 +38,9 @@ SHARED_LIB = lib/libgunwinder.so
 
 all: $(STATIC_LIB) $(SHARED_LIB) $(TOOL_BINS)
 
+tests: all
+	$(Q)bin/test_zero_size_func_lookup
+
 obj/%.o: src/%.c
 	@mkdir -p $(dir $@)
 	$(Q)echo "  CC      $@"
@@ -70,4 +73,4 @@ clean:
 	@echo "  CLEAN"
 	$(Q)rm -rf obj lib bin
 
-.PHONY: all clean install
+.PHONY: all clean install tests

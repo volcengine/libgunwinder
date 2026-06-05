@@ -646,18 +646,23 @@ static void fill_symbols_debug_info(struct per_elf_ctx *info)
 				continue;
 		}
 
-		items[actual_count].start = sym.st_value;
-		items[actual_count].end = sym.st_value + sym.st_size;
-
-		if (only_buildid) {
-			items[actual_count].private = NULL;
-			actual_count++;
-			continue;
-		}
-
 		const char *name = gu_symbol_string_table_view_get(&name_view, sym.st_name);
 		if (name == NULL)
 			goto err_free;
+		if (name[0] == '\0')
+			continue;
+
+		/*
+		 * Keep zero-sized STT_FUNC symbols as open intervals for
+		 * downstream fixup.  The interval builder will assign their end
+		 * to the next symbol start, matching perf's symbol fixup behavior
+		 * for hand-written asm functions lacking .size.
+		 */
+		items[actual_count].start = sym.st_value;
+		if (sym_type == STT_FUNC && sym.st_size == 0)
+			items[actual_count].end = 0;
+		else
+			items[actual_count].end = sym.st_value + sym.st_size;
 
 		/*
 		 * ARM/AArch64 ELF mapping symbols ($x, $d, $a, $t and suffixed
@@ -671,6 +676,12 @@ static void fill_symbols_debug_info(struct per_elf_ctx *info)
 		 */
 		if (sym_type == STT_NOTYPE && is_arm_elf_mapping_symbol_name(name))
 			continue;
+
+		if (only_buildid) {
+			items[actual_count].private = NULL;
+			actual_count++;
+			continue;
+		}
 
 		if (!golang || info->gu_ctx->go_not_strip_name) {
 			items[actual_count].private = strdup(name);
