@@ -60,7 +60,7 @@ make
 The build creates:
 
 - `lib/libgunwinder.a`
-- `lib/libgunwinder.so`
+- `lib/libgunwinder.so` with soname `libgunwinder.so.1`
 - `bin/bt_debug`
 
 Use `V=1` to print the full compiler and linker commands:
@@ -79,6 +79,20 @@ Installed files are placed under:
 
 - `/usr/lib`
 - `/usr/include/gunwinder`
+- `/usr/lib/pkgconfig`
+
+Override `PREFIX`, `LIBDIR`, `INCLUDEDIR`, or `PKGCONFIGDIR` to stage files
+under different installation paths:
+
+```bash
+make install DESTDIR=/path/to/stage PREFIX=/usr
+```
+
+Downstream builds can discover the library with pkg-config:
+
+```bash
+pkg-config --cflags --libs libgunwinder
+```
 
 ## Quick Start
 

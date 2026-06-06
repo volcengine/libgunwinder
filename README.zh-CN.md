@@ -60,7 +60,7 @@ make
 构建产物包括：
 
 - `lib/libgunwinder.a`
-- `lib/libgunwinder.so`
+- `lib/libgunwinder.so`，soname 为 `libgunwinder.so.1`
 - `bin/bt_debug`
 
 如需查看完整编译和链接命令：
@@ -79,6 +79,20 @@ make install DESTDIR=/path/to/stage
 
 - `/usr/lib`
 - `/usr/include/gunwinder`
+- `/usr/lib/pkgconfig`
+
+可以覆盖 `PREFIX`、`LIBDIR`、`INCLUDEDIR` 或 `PKGCONFIGDIR`，将文件暂存到
+不同安装路径：
+
+```bash
+make install DESTDIR=/path/to/stage PREFIX=/usr
+```
+
+下游项目可以通过 pkg-config 发现该库：
+
+```bash
+pkg-config --cflags --libs libgunwinder
+```
 
 ## 快速开始
 

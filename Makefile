@@ -1,8 +1,19 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 
 CC ?= gcc
+CXX ?= c++
 AR ?= ar
+INSTALL ?= install
+PKG_CONFIG ?= pkg-config
 CFLAGS_OPT ?= -O2 -DNDEBUG
+
+PREFIX ?= /usr
+LIBDIR ?= $(PREFIX)/lib
+INCLUDEDIR ?= $(PREFIX)/include
+PKGCONFIGDIR ?= $(LIBDIR)/pkgconfig
+
+VERSION ?= 1.0.0
+LIB_MAJOR ?= 1
 
 # Detect architecture
 UNAME_M := $(shell uname -m)
@@ -35,11 +46,21 @@ TOOL_BINS = $(patsubst tools/%.c,bin/%,$(TOOL_SRCS))
 
 STATIC_LIB = lib/libgunwinder.a
 SHARED_LIB = lib/libgunwinder.so
+SHARED_LIB_SONAME = $(SHARED_LIB).$(LIB_MAJOR)
+SHARED_LIB_REAL = $(SHARED_LIB).$(VERSION)
+PKG_CONFIG_FILE = lib/libgunwinder.pc
+
+LIBS = -lelf -ldw -lssl -lcrypto -lm -pthread
+TOOLS_LIBS = $(LIBS) -liberty
 
 all: $(STATIC_LIB) $(SHARED_LIB) $(TOOL_BINS)
 
 tests: all
 	$(Q)bin/test_zero_size_func_lookup
+	$(Q)CXX="$(CXX)" sh tests/cxx_header_smoke.sh
+
+install-smoke: all
+	$(Q)sh tests/install_pkg_config_smoke.sh
 
 obj/%.o: src/%.c
 	@mkdir -p $(dir $@)
@@ -51,26 +72,60 @@ $(STATIC_LIB): $(OBJS) Makefile
 	$(Q)echo "  AR      $@"
 	$(Q)$(AR) rcs $@ $(OBJS)
 
-$(SHARED_LIB): $(OBJS) Makefile
+$(SHARED_LIB_REAL): $(OBJS) Makefile
 	@mkdir -p $(dir $@)
 	$(Q)echo "  CC      $@"
-	$(Q)$(CC) -shared -Wl,-soname,libgunwinder.so -o $@ $(OBJS)
+	$(Q)$(CC) -shared -Wl,-soname,$(notdir $(SHARED_LIB_SONAME)) -o $@ $(OBJS) $(LIBS)
+
+$(SHARED_LIB_SONAME): $(SHARED_LIB_REAL)
+	$(Q)ln -sf $(notdir $(SHARED_LIB_REAL)) $@
+
+$(SHARED_LIB): $(SHARED_LIB_SONAME)
+	$(Q)ln -sf $(notdir $(SHARED_LIB_SONAME)) $@
+
+$(PKG_CONFIG_FILE): FORCE Makefile
+	@mkdir -p $(dir $@)
+	$(Q)echo "  GEN     $@"
+	$(Q){ \
+		echo 'prefix=$(PREFIX)'; \
+		echo 'libdir=$(LIBDIR)'; \
+		echo 'includedir=$(INCLUDEDIR)'; \
+		echo ''; \
+		echo 'Name: libgunwinder'; \
+		echo 'Description: Linux userspace stack unwinding library'; \
+		echo 'Version: $(VERSION)'; \
+		echo 'Libs: -L$${libdir} -lgunwinder'; \
+		if command -v $(PKG_CONFIG) >/dev/null 2>&1 && \
+			$(PKG_CONFIG) --exists libdw libelf openssl; then \
+			echo 'Requires.private: libdw libelf openssl'; \
+			echo 'Libs.private: -lm -pthread'; \
+		else \
+			echo 'Libs.private: $(LIBS)'; \
+		fi; \
+		echo 'Cflags: -I$${includedir}'; \
+	} > $@
 
 bin/%: tools/%.c $(STATIC_LIB)
 	@mkdir -p $(dir $@)
 	$(Q)echo "  CC      $@"
-	$(Q)$(CC) $(CFLAGS_common) $< -o $@ $(STATIC_LIB) -lelf -ldw -lssl -lcrypto -liberty -lm -pthread
+	$(Q)$(CC) $(CFLAGS_common) $< -o $@ $(STATIC_LIB) $(TOOLS_LIBS)
 
 
-install: all
-	@mkdir -p $(DESTDIR)/usr/lib
-	@mkdir -p $(DESTDIR)/usr/include/gunwinder
-	@cp $(STATIC_LIB) $(DESTDIR)/usr/lib/
-	@cp $(SHARED_LIB) $(DESTDIR)/usr/lib/
-	@cp include/gunwinder/*.h $(DESTDIR)/usr/include/gunwinder/
+install: all $(PKG_CONFIG_FILE)
+	@mkdir -p $(DESTDIR)$(LIBDIR)
+	@mkdir -p $(DESTDIR)$(INCLUDEDIR)/gunwinder
+	@mkdir -p $(DESTDIR)$(PKGCONFIGDIR)
+	$(Q)$(INSTALL) -m 0644 $(STATIC_LIB) $(DESTDIR)$(LIBDIR)/
+	$(Q)$(INSTALL) -m 0755 $(SHARED_LIB_REAL) $(DESTDIR)$(LIBDIR)/
+	$(Q)ln -sf $(notdir $(SHARED_LIB_REAL)) $(DESTDIR)$(LIBDIR)/$(notdir $(SHARED_LIB_SONAME))
+	$(Q)ln -sf $(notdir $(SHARED_LIB_SONAME)) $(DESTDIR)$(LIBDIR)/$(notdir $(SHARED_LIB))
+	$(Q)$(INSTALL) -m 0644 include/gunwinder/*.h $(DESTDIR)$(INCLUDEDIR)/gunwinder/
+	$(Q)$(INSTALL) -m 0644 $(PKG_CONFIG_FILE) $(DESTDIR)$(PKGCONFIGDIR)/
 
 clean:
 	@echo "  CLEAN"
 	$(Q)rm -rf obj lib bin
 
-.PHONY: all clean install tests
+FORCE:
+
+.PHONY: all clean install install-smoke tests FORCE

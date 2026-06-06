@@ -5,6 +5,10 @@
 
 #include "unwinder_types.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /**
  * typedef gu_frame_callback_t - Callback invoked for each unwound frame.
  * @frame: Frame metadata valid for the duration of the callback.
@@ -97,13 +101,13 @@ uint64_t gu_preload_pid_debug_info(struct gu_context *ctx, int pid);
  * gu_set_pid_private_info() - Store caller-owned metadata for a PID.
  * @ctx: Unwinder context.
  * @pid: Process ID.
- * @private: Metadata buffer to copy.
+ * @private_info: Metadata buffer to copy.
  * @size: Metadata size in bytes.
  *
- * This function copies @private. If metadata already exists for @pid, it is
- * replaced.
+ * This function copies @private_info. If metadata already exists for @pid, it
+ * is replaced.
  */
-void gu_set_pid_private_info(struct gu_context *ctx, int pid, void *private, int size);
+void gu_set_pid_private_info(struct gu_context *ctx, int pid, void *private_info, int size);
 
 /**
  * gu_get_pid_private_info() - Get copied private metadata for a PID.
@@ -215,5 +219,9 @@ enum gu_debug_dump_version_type {
  * Return: Detected debug dump version, or GU_DEBUG_DUMP_VER_ERROR.
  */
 enum gu_debug_dump_version_type gu_debug_dump_version(const char *path);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
