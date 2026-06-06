@@ -8,6 +8,40 @@
 #include <stdint.h>
 #include <sys/types.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+enum gu_arch {
+	GU_ARCH_NATIVE = 0,
+	GU_ARCH_X86_64 = 1,
+	GU_ARCH_ARM64 = 2,
+};
+
+#define GU_REGS_VERSION 1
+#define GU_REGS_MAX_DWARF_REGS 64
+
+/**
+ * struct gu_regs - Public DWARF register snapshot.
+ * @size: Size of this structure in bytes.
+ * @version: ABI version, currently GU_REGS_VERSION.
+ * @arch: Register architecture, see enum gu_arch.
+ * @valid_mask: Bit mask for initialized entries in @dwarf.
+ * @dwarf: Register values indexed by DWARF register number.
+ */
+struct gu_regs {
+	size_t size;
+	uint32_t version;
+	enum gu_arch arch;
+	uint64_t valid_mask;
+	uint64_t dwarf[GU_REGS_MAX_DWARF_REGS];
+};
+
+void gu_regs_init(struct gu_regs *regs, enum gu_arch arch);
+bool gu_regs_set(struct gu_regs *regs, uint32_t dwarf_regno, uint64_t value);
+bool gu_regs_get(const struct gu_regs *regs, uint32_t dwarf_regno,
+		 uint64_t *value);
+
 /**
  * struct gu_elf_info - Public metadata for an ELF image.
  * @base_name: Base filename without the directory path.
@@ -92,6 +126,13 @@ struct gu_stack_info {
 
 	uint8_t *stack_data;
 };
+
+static inline void gu_stack_info_set_regs(struct gu_stack_info *info,
+					  struct gu_regs *regs)
+{
+	info->regs = regs;
+	info->regs_size = regs ? regs->size : 0;
+}
 
 /**
  * enum gu_unwind_flag - Optional hints and controls for a stack snapshot.
@@ -248,5 +289,9 @@ struct gu_statistics {
 	uint64_t kernel_symbols_mem_size;
 	uint64_t unique_id_caused_reload_count;
 };
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* _GUNWINDER_TYPES_H */

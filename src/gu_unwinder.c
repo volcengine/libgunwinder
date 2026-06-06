@@ -17,6 +17,7 @@
  */
 
 #include "gunwinder/unwinder_types.h"
+#include <stddef.h>
 #include <unistd.h>
 
 #include "gu_unwinder.h"
@@ -42,6 +43,55 @@ static __thread uint64_t stack_read_out_of_range_addr;
 static __thread uint64_t stack_read_out_of_range_start;
 static __thread uint64_t stack_read_out_of_range_end;
 static __thread uint64_t stack_read_out_of_range_raw_sp;
+
+static enum gu_arch compiled_arch(void)
+{
+#if defined(GUNWINDER_X86)
+	return GU_ARCH_X86_64;
+#elif defined(GUNWINDER_ARM64)
+	return GU_ARCH_ARM64;
+#else
+	return GU_ARCH_NATIVE;
+#endif
+}
+
+static bool arch_is_compatible(enum gu_arch arch)
+{
+	return arch == GU_ARCH_NATIVE || arch == compiled_arch();
+}
+
+static struct gu_regs *public_regs_from_info(struct gu_stack_info *info)
+{
+	struct gu_regs *regs;
+
+	if (!info || !info->regs)
+		return NULL;
+	if (info->regs_size < sizeof(*regs))
+		return NULL;
+
+	regs = (struct gu_regs *)info->regs;
+	if (regs->size != sizeof(*regs))
+		return NULL;
+
+	return regs;
+}
+
+static bool legacy_reg_bounds_ok(struct gu_stack_info *info, int regno,
+				 unsigned long *offset)
+{
+	size_t byte_offset;
+
+	if (regno >= sizeof(regs) / sizeof(regs[0]))
+		return false;
+
+	byte_offset = regs[regno];
+	if (info->regs_size < byte_offset ||
+	    info->regs_size - byte_offset < sizeof(unsigned long))
+		return false;
+
+	*offset = byte_offset / sizeof(unsigned long);
+	return true;
+}
 
 bool gu_last_stack_read_out_of_range(uint64_t *addr, uint64_t *start,
 				     uint64_t *end, uint64_t *raw_sp)
@@ -103,17 +153,24 @@ static bool dw_pop(struct dw_eval_stack *stack, uint64_t *val)
 
 bool get_regs(struct gu_stack_info *info, int regno, uint64_t *val)
 {
+	struct gu_regs *public_regs;
+	unsigned long offset;
+
 	if (!info || !info->regs || !val)
 		return false;
 	if (regno < 0)
 		return false;
+	public_regs = public_regs_from_info(info);
+	if (public_regs) {
+		if (!arch_is_compatible(public_regs->arch))
+			return false;
+		return gu_regs_get(public_regs, regno, val);
+	}
 	struct pt_regs *reg = (struct pt_regs *)info->regs;
-	if (regno >= sizeof(regs) / sizeof(unsigned long)) {
+	if (!legacy_reg_bounds_ok(info, regno, &offset)) {
 		GU_VERBOSE(THREE_TAB_STR "get_regs: %d failed", regno);
 		return false;
 	}
-
-	unsigned long offset = regs[regno] / sizeof(unsigned long);
 
 	*val = ((unsigned long *)(reg))[offset];
 	GU_VERBOSE(THREE_TAB_STR "get_regs: %d offset: %ld val: 0x%lx", regno, offset, *val);
@@ -123,15 +180,22 @@ bool get_regs(struct gu_stack_info *info, int regno, uint64_t *val)
 
 bool write_regs(struct gu_stack_info *info, int regno, uint64_t val)
 {
+	struct gu_regs *public_regs;
+	unsigned long offset;
+
 	if (!info || !info->regs)
 		return false;
 	if (regno < 0)
 		return false;
+	public_regs = public_regs_from_info(info);
+	if (public_regs) {
+		if (!arch_is_compatible(public_regs->arch))
+			return false;
+		return gu_regs_set(public_regs, regno, val);
+	}
 	struct pt_regs *reg = (struct pt_regs *)info->regs;
-	if (regno >= sizeof(regs) / sizeof(unsigned long))
+	if (!legacy_reg_bounds_ok(info, regno, &offset))
 		return false;
-
-	unsigned long offset = regs[regno] / sizeof(unsigned long);
 
 	((unsigned long *)(reg))[offset] = val;
 	GU_VERBOSE(THREE_TAB_STR "write_regs: %d offset: %ld val: 0x%lx", regno, offset, val);

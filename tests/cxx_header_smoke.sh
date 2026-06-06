@@ -19,9 +19,14 @@ int main()
 {
 	gu_frame_callback_t callback = nullptr;
 	pid_ctx_callback pid_callback = nullptr;
+	gu_regs regs = {};
+	gu_stack_info info = {};
 
+	gu_regs_init(&regs, GU_ARCH_NATIVE);
+	gu_stack_info_set_regs(&info, &regs);
 	(void)callback;
 	(void)pid_callback;
+	(void)info;
 	return 0;
 }
 EOF

@@ -150,7 +150,7 @@ void gu_debug_dump_sample(struct gu_stack_info *info, const char *path, bool dum
 	    fwrite(&info->flags, sizeof(info->flags), 1, file) != 1)
 		goto out_close_file;
 
-	size_t regs_size = sizeof(struct pt_regs);
+	size_t regs_size = info->regs_size ? info->regs_size : sizeof(struct pt_regs);
 	if (fwrite(&regs_size, sizeof(regs_size), 1, file) != 1)
 		goto out_close_file;
 

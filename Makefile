@@ -57,6 +57,7 @@ all: $(STATIC_LIB) $(SHARED_LIB) $(TOOL_BINS)
 
 tests: all
 	$(Q)bin/test_zero_size_func_lookup
+	$(Q)bin/test_public_regs
 	$(Q)CXX="$(CXX)" sh tests/cxx_header_smoke.sh
 
 install-smoke: all
