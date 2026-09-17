@@ -947,6 +947,67 @@ static int test_cfi_set_loc(void)
 	return expect_current_cfa("cfi_set_loc", &b, 0x100b, fx.raw_sp + 32);
 }
 
+static int expect_ops_fail(const char *name, const Dwarf_Op *ops, size_t nops)
+{
+struct eval_fixture fx;
+uint64_t actual = 0xcafef00d;
+
+init_eval_fixture(&fx);
+if (gu_dwarf_ops_eval(NULL, ops, nops, &actual, 0, fx.raw_sp, &fx.info)) {
+fprintf(stderr, "%s: expression evaluation must fail but succeeded\n",
+name);
+return 1;
+}
+
+return 0;
+}
+
+/* Signed INT64_MIN / -1 overflows and must be rejected, not wrapped. */
+static int test_expr_div_int64_min_overflow_fails(void)
+{
+const Dwarf_Op ops[] = {
+{ .atom = DW_OP_const8u, .number = 0x8000000000000000ULL },
+{ .atom = DW_OP_const1s, .number = -1 },
+{ .atom = DW_OP_div },
+};
+
+return expect_ops_fail("expr_div_int64_min_overflow_fails", ops,
+ARRAY_SIZE(ops));
+}
+
+static int test_expr_shr_overflow_fails(void)
+{
+const Dwarf_Op ops[] = {
+{ .atom = DW_OP_lit1 },
+{ .atom = DW_OP_const1u, .number = 64 },
+{ .atom = DW_OP_shr },
+};
+
+return expect_ops_fail("expr_shr_overflow_fails", ops, ARRAY_SIZE(ops));
+}
+
+static int test_expr_shl_overflow_fails(void)
+{
+const Dwarf_Op ops[] = {
+{ .atom = DW_OP_lit1 },
+{ .atom = DW_OP_const1u, .number = 64 },
+{ .atom = DW_OP_shl },
+};
+
+return expect_ops_fail("expr_shl_overflow_fails", ops, ARRAY_SIZE(ops));
+}
+
+static int test_expr_shra_overflow_fails(void)
+{
+const Dwarf_Op ops[] = {
+{ .atom = DW_OP_lit1 },
+{ .atom = DW_OP_const1u, .number = 64 },
+{ .atom = DW_OP_shra },
+};
+
+return expect_ops_fail("expr_shra_overflow_fails", ops, ARRAY_SIZE(ops));
+}
+
 static const struct test_case cases[] = {
 	{ "expr_literal_arithmetic", test_expr_literal_arithmetic },
 	{ "expr_register_base", test_expr_register_base },
@@ -976,6 +1037,10 @@ static const struct test_case cases[] = {
 	{ "cfi_truncated_instruction_fails", test_cfi_truncated_instruction_fails },
 	{ "cfi_stack_read_out_of_range", test_cfi_stack_read_out_of_range },
 	{ "cfi_set_loc", test_cfi_set_loc },
+{ "expr_div_int64_min_overflow_fails", test_expr_div_int64_min_overflow_fails },
+{ "expr_shr_overflow_fails", test_expr_shr_overflow_fails },
+{ "expr_shl_overflow_fails", test_expr_shl_overflow_fails },
+{ "expr_shra_overflow_fails", test_expr_shra_overflow_fails },
 };
 
 int main(int argc, char **argv)

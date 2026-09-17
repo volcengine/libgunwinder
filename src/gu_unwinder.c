@@ -425,6 +425,9 @@ bool gu_dwarf_ops_eval(Dwarf_Frame *frame, const Dwarf_Op *ops, size_t nops,
 				goto failed;
 			if (val2 == 0)
 				goto failed;
+			/* Signed INT64_MIN / -1 overflows. */
+			if ((int64_t)val1 == INT64_MIN && (int64_t)val2 == -1)
+				goto failed;
 			if (!dw_push(&dw_stack, (int64_t)val1 / (int64_t)val2))
 				goto failed;
 			break;
@@ -451,14 +454,20 @@ bool gu_dwarf_ops_eval(Dwarf_Frame *frame, const Dwarf_Op *ops, size_t nops,
 			break;
 		case DW_OP_shr:
 			if (!dw_pop(&dw_stack, &val2) ||
-			    !dw_pop(&dw_stack, &val1) ||
-			    !dw_push(&dw_stack, val1 >> val2))
+			    !dw_pop(&dw_stack, &val1))
+				goto failed;
+			if (val2 >= 64)
+				goto failed;
+			if (!dw_push(&dw_stack, val1 >> val2))
 				goto failed;
 			break;
 		case DW_OP_shl:
 			if (!dw_pop(&dw_stack, &val2) ||
-			    !dw_pop(&dw_stack, &val1) ||
-			    !dw_push(&dw_stack, val1 << val2))
+			    !dw_pop(&dw_stack, &val1))
+				goto failed;
+			if (val2 >= 64)
+				goto failed;
+			if (!dw_push(&dw_stack, val1 << val2))
 				goto failed;
 			break;
 		case DW_OP_plus:
@@ -481,8 +490,11 @@ bool gu_dwarf_ops_eval(Dwarf_Frame *frame, const Dwarf_Op *ops, size_t nops,
 			break;
 		case DW_OP_shra:
 			if (!dw_pop(&dw_stack, &val2) ||
-			    !dw_pop(&dw_stack, &val1) ||
-			    !dw_push(&dw_stack, (int64_t)val1 >> (int64_t)val2))
+			    !dw_pop(&dw_stack, &val1))
+				goto failed;
+			if (val2 >= 64)
+				goto failed;
+			if (!dw_push(&dw_stack, (int64_t)val1 >> (int64_t)val2))
 				goto failed;
 			break;
 		case DW_OP_le:
