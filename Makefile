@@ -40,6 +40,8 @@ all: $(STATIC_LIB) $(SHARED_LIB) $(TOOL_BINS)
 
 tests: all
 	$(Q)bin/test_zero_size_func_lookup
+	$(Q)bin/cfi_stress
+	$(Q)bin/test_symbol_resolution
 
 obj/%.o: src/%.c
 	@mkdir -p $(dir $@)
