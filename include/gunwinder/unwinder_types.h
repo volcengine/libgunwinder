@@ -160,6 +160,7 @@ static inline bool gu_flags_is_set(const struct gu_stack_info *info, enum gu_unw
  * @GU_UNWIND_REASON_CFI_FRAME_CFA_CALC_FAILED: CFA expression evaluation failed.
  * @GU_UNWIND_REASON_END_OF_STACK: Reached a known stack-bottom frame.
  * @GU_UNWIND_REASON_STACK_READ_OUT_OF_RANGE: CFI read outside stack snapshot.
+ * @GU_UNWIND_REASON_NO_PROGRESS: Next frame did not advance the stack (unwind loop).
  * @GU_UNWIND_REASON_UNKNOWN: Unclassified stop reason.
  */
 enum gu_unwind_reason {
@@ -178,6 +179,7 @@ enum gu_unwind_reason {
 	GU_UNWIND_REASON_CFI_FRAME_CFA_CALC_FAILED,
 	GU_UNWIND_REASON_END_OF_STACK,
 	GU_UNWIND_REASON_STACK_READ_OUT_OF_RANGE,
+	GU_UNWIND_REASON_NO_PROGRESS,
 	GU_UNWIND_REASON_UNKNOWN = 0xff,
 };
 

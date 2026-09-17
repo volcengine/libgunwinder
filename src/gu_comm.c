@@ -284,6 +284,13 @@ struct maps_info *gu_get_maps_info(int pid, int *count, char permission_flag, ch
 			GU_OUTPUT("Failed to allocate memory path\n");
 			goto fail;
 		}
+		/*
+		 * The " (deleted)" suffix in /proc/<pid>/maps marks a file unlinked
+		 * after being mapped.  sscanf() stops at the space, so record it here;
+		 * callers must read the live mapping (/proc/<pid>/exe or map_files)
+		 * rather than a possibly replaced file at the same pathname.
+		 */
+		info[index].deleted = strstr(maps_line, " (deleted)") != NULL;
 
 		index++;
 	}

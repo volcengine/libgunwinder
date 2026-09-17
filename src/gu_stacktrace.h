@@ -26,7 +26,8 @@
  * @ELF_SCN_TYPE_ZDWARF_FRAME_HDR: Compressed .debug_frame_hdr section.
  * @ELF_SCN_TYPE_EH_FRAME: .eh_frame section.
  * @ELF_SCN_TYPE_EH_FRAME_HDR: .eh_frame_hdr section.
- * @ELF_SCN_TYPE_MAX: Number of tracked section slots.
+ * @ELF_SCN_TYPE_GNU_DEBUGLINK:    .gnu_debuglink section.
+ X
  */
 enum elf_scn_type {
 	ELF_SCN_TYPE_GO_BUILD_ID = 0,
@@ -39,6 +40,7 @@ enum elf_scn_type {
 	ELF_SCN_TYPE_ZDWARF_FRAME_HDR,
 	ELF_SCN_TYPE_EH_FRAME,
 	ELF_SCN_TYPE_EH_FRAME_HDR,
+	ELF_SCN_TYPE_GNU_DEBUGLINK,
 	ELF_SCN_TYPE_MAX,
 };
 

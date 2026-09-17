@@ -31,8 +31,12 @@
 #include <errno.h>
 #include <limits.h>
 #include <poll.h>
+#include <stdatomic.h>
 #include <time.h>
+#include <sys/syscall.h>
 #include <sys/eventfd.h>
+#include <asm/unistd.h>
+#include <linux/openat2.h>
 
 #include "gunwinder/unwinder_types.h"
 #include "gu_stacktrace.h"
@@ -45,7 +49,7 @@
 void gu_pid_ctx_event_notify_pid_ctx(int pid, unsigned long long start_time, const char *comm, unsigned int type);
 
 static char *elf_scn_type_str[ELF_SCN_TYPE_MAX] = {
-	".note.go.buildid", ".note.gnu.build-id", ".symtab", ".dynsym", ".debug_frame", ".debug_frame_hdr", ".zdebug_frame", ".zdebug_frame_hdr", ".eh_frame", ".eh_frame_hdr",
+	".note.go.buildid", ".note.gnu.build-id", ".symtab", ".dynsym", ".debug_frame", ".debug_frame_hdr", ".zdebug_frame", ".zdebug_frame_hdr", ".eh_frame", ".eh_frame_hdr", ".gnu_debuglink",
 };
 
 #define STANDARD_BUILD_ID_LEN 20
@@ -53,6 +57,17 @@ static char *elf_scn_type_str[ELF_SCN_TYPE_MAX] = {
 #define GU_ELF_RETIRE_TIMER_INTERVAL_MS 1000
 #define GU_PID_MAPS_RELOAD_MIN_INTERVAL_NS (30ULL * 1000000000ULL)
 #define GU_PID_MAPS_RELOAD_MAX_INTERVAL_NS (90ULL * 1000000000ULL)
+#define GU_OPEN_IN_ROOT_MAX_SYMLINKS 40
+#define GU_OPEN_IN_ROOT_MAX_COMPONENTS (PATH_MAX / 2 + 1)
+
+/* -1 unknown, 0 unavailable, 1 available; avoids repeated ENOSYS syscalls. */
+static atomic_int gu_openat2_in_root_availability = -1;
+
+#ifndef SYS_openat2
+#ifdef __NR_openat2
+#define SYS_openat2 __NR_openat2
+#endif
+#endif
 
 struct kernel_symbol_entry {
 	char *name;
@@ -391,6 +406,178 @@ static char *get_debug_info_path_by_id(unsigned char *build_id)
 	snprintf(path, sizeof(path), "/usr/lib/debug/.build-id/%02x/%s.debug", build_id[0], build_id_str);
 
 	return strdup(path);
+}
+
+/*
+ * .gnu_debuglink carries the basename of a separate debuginfo file followed
+ * by padding and a trailing 4-byte CRC32 (zlib/IEEE polynomial) of that
+ * file's full contents.
+ */
+#define GNU_DEBUGLINK_CRC_SIZE 4
+
+static bool get_elf_gnu_debuglink(struct per_elf_ctx *info,
+			  char *name_buf, size_t name_buf_size,
+			  uint32_t *crc_out)
+{
+	Elf_Data *data = NULL;
+
+	if (!info || !info->scn[ELF_SCN_TYPE_GNU_DEBUGLINK] || !name_buf ||
+	    name_buf_size == 0 || !crc_out)
+		return false;
+
+	data = elf_getdata(info->scn[ELF_SCN_TYPE_GNU_DEBUGLINK], NULL);
+	if (!data || data->d_size <= GNU_DEBUGLINK_CRC_SIZE)
+		return false;
+
+	const unsigned char *raw = data->d_buf;
+	size_t crc_offset = data->d_size - GNU_DEBUGLINK_CRC_SIZE;
+	size_t name_len = strnlen((const char *)raw, crc_offset);
+	if (name_len == 0 || name_len >= crc_offset || name_len >= name_buf_size)
+		return false;
+
+	memcpy(name_buf, raw, name_len);
+	name_buf[name_len] = '\0';
+	/* The debuglink entry must be a plain basename. */
+	if (strchr(name_buf, '/') != NULL)
+		return false;
+
+	uint32_t crc;
+	memcpy(&crc, raw + crc_offset, sizeof(crc));
+	*crc_out = crc;
+	return true;
+}
+
+/* zlib-compatible CRC32 (init 0xffffffff, final xor), table-driven. */
+static uint32_t gu_crc32_table[256];
+static pthread_once_t gu_crc32_table_once = PTHREAD_ONCE_INIT;
+
+static void gu_crc32_table_init(void)
+{
+	for (uint32_t i = 0; i < 256; i++) {
+		uint32_t c = i;
+		for (int j = 0; j < 8; j++)
+			c = (c & 1) ? (0xedb88320U ^ (c >> 1)) : (c >> 1);
+		gu_crc32_table[i] = c;
+	}
+}
+
+static uint32_t gu_crc32_update(uint32_t crc, const unsigned char *buf, size_t len)
+{
+	pthread_once(&gu_crc32_table_once, gu_crc32_table_init);
+
+	crc = ~crc;
+	for (size_t i = 0; i < len; i++)
+		crc = gu_crc32_table[(crc ^ buf[i]) & 0xff] ^ (crc >> 8);
+	return ~crc;
+}
+
+static bool gu_debuglink_crc_matches(const char *path, uint32_t expected_crc)
+{
+	int fd = open(path, O_RDONLY | O_CLOEXEC, 0);
+	if (fd < 0)
+		return false;
+
+	uint32_t crc = 0;
+	unsigned char buf[65536];
+	bool matched = false;
+
+	for (;;) {
+		ssize_t n = read(fd, buf, sizeof(buf));
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			break;
+		}
+		if (n == 0) {
+			matched = (crc == expected_crc);
+			break;
+		}
+		crc = gu_crc32_update(crc, buf, (size_t)n);
+	}
+
+	close(fd);
+	return matched;
+}
+
+static char *gu_debuglink_try_candidate(const char *path, uint32_t expected_crc)
+{
+	struct stat st;
+
+	if (!path || access(path, R_OK) != 0)
+		return NULL;
+	if (stat(path, &st) != 0 || !S_ISREG(st.st_mode))
+		return NULL;
+	if (!gu_debuglink_crc_matches(path, expected_crc)) {
+		GU_VERBOSE("gnu_debuglink candidate crc mismatch: %s", path);
+		return NULL;
+	}
+	GU_VERBOSE("gnu_debuglink resolved: %s", path);
+	return strdup(path);
+}
+
+/*
+ * Locate the debuginfo named by .gnu_debuglink, following the standard
+ * search order: object directory, its .debug subdir, then the global debug
+ * root.  In live mode the target rootfs is searched before the host root.
+ * Deleted mappings (/proc/<pid>/exe or map_files) have no real object
+ * directory, so only global roots are searched.
+ */
+static char *find_debug_info_path_by_debuglink(struct per_elf_ctx *info,
+				       const char *file_name,
+				       const char *pid_root_path,
+				       bool live_mode,
+				       bool deleted_mapping)
+{
+	char link_name[PATH_MAX];
+	uint32_t expected_crc;
+
+	if (!get_elf_gnu_debuglink(info, link_name, sizeof(link_name),
+				   &expected_crc))
+		return NULL;
+
+	char obj_dir[PATH_MAX];
+	char *result = NULL;
+
+	strncpy(obj_dir, file_name, sizeof(obj_dir) - 1);
+	obj_dir[sizeof(obj_dir) - 1] = '\0';
+	char *slash = strrchr(obj_dir, '/');
+	if (slash)
+		*slash = '\0';
+	else
+		obj_dir[0] = '\0';
+
+	if (!deleted_mapping && obj_dir[0] != '\0') {
+		char candidate[PATH_MAX];
+
+		/* Object directory, resolved through the target rootfs live. */
+		snprintf(candidate, sizeof(candidate), "%s%s/%s",
+			 pid_root_path, obj_dir, link_name);
+		result = gu_debuglink_try_candidate(candidate, expected_crc);
+
+		/* .debug subdirectory of the object directory. */
+		if (!result) {
+			snprintf(candidate, sizeof(candidate), "%s%s/.debug/%s",
+				 pid_root_path, obj_dir, link_name);
+			result = gu_debuglink_try_candidate(candidate, expected_crc);
+		}
+	}
+
+	/* Global debug root of the target rootfs, then the host root. */
+	const char *global_roots[] = { pid_root_path, "" };
+	size_t global_root_count = live_mode ? 2 : 1;
+
+	for (size_t r = 0; r < global_root_count && !result; r++) {
+		char candidate[PATH_MAX];
+
+		snprintf(candidate, sizeof(candidate), "%s/usr/lib/debug%s/%s",
+			 global_roots[r], obj_dir, link_name);
+		result = gu_debuglink_try_candidate(candidate, expected_crc);
+	}
+
+	if (!result)
+		GU_VERBOSE("gnu_debuglink %s not found with a matching crc",
+			   link_name);
+	return result;
 }
 
 static unsigned char *get_elf_build_id(struct per_elf_ctx *info, int *build_id_len)
@@ -820,7 +1007,203 @@ static const char *get_vdso_dump_path(struct gu_context *ctx)
 	return ctx->vdso_file_path;
 }
 
-static struct per_elf_ctx *load_elf(struct gu_context *ctx, char *file_name, int pid)
+/*
+ * Open @path inside the sampled process rootfs with RESOLVE_IN_ROOT so
+ * absolute symlinks (e.g. cmdline[0]) cannot escape /proc/<pid>/root into
+ * the host root.
+ */
+static int gu_openat2_in_root(int root_fd, const char *path, int flags)
+{
+	struct open_how how = {
+		.flags = flags | O_CLOEXEC,
+		.resolve = RESOLVE_IN_ROOT,
+	};
+	int fd;
+
+	if (root_fd < 0 || !path || path[0] == '\0') {
+		errno = EINVAL;
+		return -1;
+	}
+
+#ifdef SYS_openat2
+	if (atomic_load_explicit(&gu_openat2_in_root_availability,
+				  memory_order_relaxed) == 0) {
+		errno = ENOSYS;
+		return -1;
+	}
+
+	fd = syscall(SYS_openat2, root_fd, path, &how, sizeof(how));
+	if (fd >= 0)
+		atomic_store_explicit(&gu_openat2_in_root_availability, 1,
+				      memory_order_relaxed);
+	else if (errno == ENOSYS)
+		atomic_store_explicit(&gu_openat2_in_root_availability, 0,
+				      memory_order_relaxed);
+	return fd;
+#else
+	atomic_store_explicit(&gu_openat2_in_root_availability, 0,
+			      memory_order_relaxed);
+	errno = ENOSYS;
+	return -1;
+#endif
+}
+
+/*
+ * Emulate RESOLVE_IN_ROOT on kernels without openat2 (< 5.6). Every path
+ * component is pinned with O_PATH|O_NOFOLLOW before it is inspected,
+ * absolute symlinks restart from root, and '..' is clamped at root.
+ */
+static int gu_openat2_in_root_compat(int root_fd, const char *path, int flags)
+{
+	char pending_path[PATH_MAX];
+	char next_path[PATH_MAX];
+	char link_target[PATH_MAX];
+	int dir_fds[GU_OPEN_IN_ROOT_MAX_COMPONENTS];
+	char *cursor;
+	int depth = 0;
+	int symlink_count = 0;
+	int fd = -1;
+	int saved_errno = 0;
+
+	if (root_fd < 0 || !path || path[0] == '\0') {
+		errno = EINVAL;
+		return -1;
+	}
+	if (snprintf(pending_path, sizeof(pending_path), "%s", path) >=
+	    (int)sizeof(pending_path)) {
+		errno = ENAMETOOLONG;
+		return -1;
+	}
+
+	dir_fds[0] = fcntl(root_fd, F_DUPFD_CLOEXEC, 3);
+	if (dir_fds[0] < 0)
+		return -1;
+	cursor = pending_path;
+
+	for (;;) {
+		char *component;
+		char *remainder;
+		struct stat st;
+		int component_fd;
+		ssize_t link_len;
+
+		while (*cursor == '/')
+			cursor++;
+		if (*cursor == '\0') {
+			fd = openat(dir_fds[depth], ".", flags | O_CLOEXEC | O_NOFOLLOW);
+			break;
+		}
+
+		component = cursor;
+		while (*cursor != '\0' && *cursor != '/')
+			cursor++;
+		if (*cursor != '\0')
+			*cursor++ = '\0';
+		remainder = cursor;
+
+		if (strcmp(component, ".") == 0)
+			continue;
+		if (strcmp(component, "..") == 0) {
+			if (depth > 0)
+				close(dir_fds[depth--]);
+			continue;
+		}
+
+		component_fd = openat(dir_fds[depth], component,
+				      O_PATH | O_NOFOLLOW | O_CLOEXEC);
+		if (component_fd < 0)
+			break;
+		if (fstat(component_fd, &st) < 0) {
+			close(component_fd);
+			break;
+		}
+		if (S_ISLNK(st.st_mode)) {
+			link_len = readlinkat(component_fd, "", link_target,
+					      sizeof(link_target) - 1);
+			close(component_fd);
+			if (link_len < 0)
+				break;
+			if (++symlink_count > GU_OPEN_IN_ROOT_MAX_SYMLINKS) {
+				errno = ELOOP;
+				break;
+			}
+			link_target[link_len] = '\0';
+			if (snprintf(next_path, sizeof(next_path), "%s%s%s",
+				     link_target, *remainder ? "/" : "", remainder) >=
+			    (int)sizeof(next_path)) {
+				errno = ENAMETOOLONG;
+				break;
+			}
+			if (link_target[0] == '/') {
+				while (depth > 0)
+					close(dir_fds[depth--]);
+			}
+			strcpy(pending_path, next_path);
+			cursor = pending_path;
+			continue;
+		}
+
+		if (*remainder == '\0') {
+			close(component_fd);
+			fd = openat(dir_fds[depth], component,
+				    flags | O_CLOEXEC | O_NOFOLLOW);
+			break;
+		}
+		if (!S_ISDIR(st.st_mode)) {
+			close(component_fd);
+			errno = ENOTDIR;
+			break;
+		}
+		if (depth + 1 >= GU_OPEN_IN_ROOT_MAX_COMPONENTS) {
+			close(component_fd);
+			errno = ENAMETOOLONG;
+			break;
+		}
+		dir_fds[++depth] = component_fd;
+	}
+
+	if (fd < 0)
+		saved_errno = errno;
+	while (depth >= 0)
+		close(dir_fds[depth--]);
+	if (fd < 0)
+		errno = saved_errno;
+	return fd;
+}
+
+static int gu_open_pid_root_path(int pid, const char *path, int flags)
+{
+	char pid_root_path[64];
+	int root_fd;
+	int fd;
+
+	if (!path || path[0] == '\0') {
+		errno = EINVAL;
+		return -1;
+	}
+
+	snprintf(pid_root_path, sizeof(pid_root_path), "/proc/%d/root", pid);
+	root_fd = open(pid_root_path, O_PATH | O_DIRECTORY | O_CLOEXEC);
+	if (root_fd < 0)
+		return -1;
+
+	fd = gu_openat2_in_root(root_fd, path, flags);
+	if (fd < 0 && errno == ENOSYS)
+		fd = gu_openat2_in_root_compat(root_fd, path, flags);
+	close(root_fd);
+	return fd;
+}
+
+/*
+ * load_elf() - Load an ELF's symbol/CFI data into a cached per-elf context.
+ * @file_name: Logical mapped path, used for naming and debug-file lookup.
+ * @open_path: Optional override for the file actually opened; used for
+ *             deleted mappings, where /proc/<pid>/exe or
+ *             /proc/<pid>/map_files/<start>-<end> reference the bytes the
+ *             process really has mapped.
+ */
+static struct per_elf_ctx *load_elf(struct gu_context *ctx, char *file_name, int pid,
+				   const char *open_path)
 {
 	char pid_root_path[64];
 	int len = 0;
@@ -877,15 +1260,28 @@ static struct per_elf_ctx *load_elf(struct gu_context *ctx, char *file_name, int
 	else
 		snprintf(pid_root_path, 64, "");
 
-	ctx->tmp_ctx.elf_file_path = vdso_local ? strdup(file_name) : gu_path_join(pid_root_path, file_name);
+	if (open_path)
+		ctx->tmp_ctx.elf_file_path = strdup(open_path);
+	else
+		ctx->tmp_ctx.elf_file_path = vdso_local ? strdup(file_name) : gu_path_join(pid_root_path, file_name);
 	if (!ctx->tmp_ctx.elf_file_path)
 		goto exit;
 
 	GU_VERBOSE("Loading elf: %s", ctx->tmp_ctx.elf_file_path);
 
-	ctx->tmp_ctx.elf_fd = open(ctx->tmp_ctx.elf_file_path, O_RDONLY, 0);
+	if (open_path) {
+		ctx->tmp_ctx.elf_fd =
+			open(open_path, O_RDONLY | O_CLOEXEC, 0);
+	} else if (!ctx->debug && !vdso_local) {
+		ctx->tmp_ctx.elf_fd =
+			gu_open_pid_root_path(pid, file_name, O_RDONLY);
+	} else {
+		ctx->tmp_ctx.elf_fd =
+			open(ctx->tmp_ctx.elf_file_path, O_RDONLY | O_CLOEXEC, 0);
+	}
 	if (ctx->tmp_ctx.elf_fd < 0) {
-		GU_VERBOSE("open: %s failed: %s", ctx->tmp_ctx.elf_file_path, strerror(errno));
+		GU_VERBOSE("open: %s failed: %s",
+		   open_path ? open_path : ctx->tmp_ctx.elf_file_path, strerror(errno));
 		goto exit;
 	}
 
@@ -938,25 +1334,37 @@ static struct per_elf_ctx *load_elf(struct gu_context *ctx, char *file_name, int
 		ctx->tmp_ctx.exec_virt_addr = get_elf_exec_virt_addr(&ctx->tmp_ctx);
 	}
 
-	if (ctx->tmp_ctx.build_id_len != STANDARD_BUILD_ID_LEN) {
-		/*
-		 * Non-standard identities include the MD5 fallback above and Go
-		 * build IDs.  They do not match the GNU build-id directory
-		 * layout, so debug data can only come from the mapped ELF itself.
-		 */
-		ctx->tmp_ctx.debug_file_path = strdup(ctx->tmp_ctx.elf_file_path);
-	} else {
+	if (ctx->tmp_ctx.build_id_len == STANDARD_BUILD_ID_LEN) {
 		char *tmp_path = get_debug_info_path_by_id(ctx->tmp_ctx.build_id);
-		ctx->tmp_ctx.debug_file_path = tmp_path;
 		/* Prefer host-wide debuginfo, then try the target rootfs. */
-		if (access(ctx->tmp_ctx.debug_file_path, F_OK) != 0) {
-			ctx->tmp_ctx.debug_file_path = gu_path_join(pid_root_path, tmp_path);
+		if (access(tmp_path, F_OK) == 0) {
+			ctx->tmp_ctx.debug_file_path = tmp_path;
+		} else {
+			ctx->tmp_ctx.debug_file_path =
+				gu_path_join(pid_root_path, tmp_path);
 			free(tmp_path);
 			if (access(ctx->tmp_ctx.debug_file_path, F_OK) != 0) {
 				free(ctx->tmp_ctx.debug_file_path);
-				ctx->tmp_ctx.debug_file_path = strdup(ctx->tmp_ctx.elf_file_path);
+				ctx->tmp_ctx.debug_file_path = NULL;
 			}
 		}
+	}
+
+	/* Fall back to .gnu_debuglink separate debuginfo (e.g. scylla). */
+	if (!ctx->tmp_ctx.debug_file_path) {
+		ctx->tmp_ctx.debug_file_path =
+			find_debug_info_path_by_debuglink(
+				&ctx->tmp_ctx, file_name, pid_root_path,
+				!ctx->debug, open_path != NULL);
+	}
+
+	if (!ctx->tmp_ctx.debug_file_path) {
+		/*
+		 * Non-standard build identities (MD5 fallback, Go build-id) and
+		 * ELFs without external debuginfo resolve from the mapped file.
+		 */
+		ctx->tmp_ctx.debug_file_path =
+			strdup(ctx->tmp_ctx.elf_file_path);
 	}
 
 	if (strcmp(ctx->tmp_ctx.elf_file_path, ctx->tmp_ctx.debug_file_path) != 0) {
@@ -985,12 +1393,12 @@ static struct per_elf_ctx *load_elf(struct gu_context *ctx, char *file_name, int
 	} else {
 		ctx->tmp_ctx.golang = false;
 		ctx->tmp_ctx.gu_cfi = gu_cfi_init(&ctx->tmp_ctx);
+		fill_symbols_debug_info(&ctx->tmp_ctx);
 	}
 
 	if (ctx->tmp_ctx.gu_cfi) {
 		ctx->statistics.cfi_mem_size += ctx->tmp_ctx.gu_cfi->cfi_mem_usage;
 		ctx->statistics.cfi_data_mem_size += ctx->tmp_ctx.gu_cfi->cfi_data_mem_usage;
-		fill_symbols_debug_info(&ctx->tmp_ctx);
 	}
 
 	elf_ctx = calloc(1, sizeof(struct per_elf_ctx));
@@ -1147,10 +1555,29 @@ struct per_pid_ctx *gu_load_pid(struct gu_context *ctx, struct gu_stack_info *in
 		unsigned long map_exec_virt_addr = 0;
 		struct per_elf_map_ctx *map_ctx = NULL;
 		struct per_elf_ctx *elf;
+		char live_open_path[64] = { 0 };
+		const char *open_path = NULL;
 
 		items[i].start = maps[i].start;
 		items[i].end = maps[i].end;
-		elf = load_elf(ctx, maps[i].path, pid);
+
+		/*
+		 * A " (deleted)" mapping may now name a different inode deployed
+		 * at the same path.  Read the live mapping: /proc/<pid>/exe for
+		 * the main executable, map_files for everything else.
+		 */
+		if (!ctx->debug && maps[i].deleted) {
+			if (i == 0)
+				snprintf(live_open_path, sizeof(live_open_path),
+					 "/proc/%d/exe", pid);
+			else
+				snprintf(live_open_path, sizeof(live_open_path),
+					 "/proc/%d/map_files/%lx-%lx", pid,
+					 maps[i].start, maps[i].end);
+			open_path = live_open_path;
+		}
+
+		elf = load_elf(ctx, maps[i].path, pid, open_path);
 		map_exec_virt_addr =
 			gu_resolve_map_exec_virt_addr(elf, &maps[i]);
 		if (i == 0 && elf && elf->golang)
@@ -1818,13 +2245,53 @@ static bool is_stack_bottom_symbol(const char *sym)
 	return false;
 }
 
-static unsigned long gu_cfi_lookup_pc_for_frame(unsigned long pc,
-						bool initial_frame,
-						bool signal_frame)
+static unsigned long gu_frame_lookup_pc_for_return_address(unsigned long pc,
+						       bool initial_frame,
+						       bool signal_frame)
 {
 	if (initial_frame || signal_frame || pc == 0)
 		return pc;
 	return pc - 1;
+}
+
+static unsigned long gu_cfi_lookup_pc_for_frame(unsigned long pc,
+						bool initial_frame,
+						bool signal_frame)
+{
+	return gu_frame_lookup_pc_for_return_address(pc, initial_frame,
+						       signal_frame);
+}
+
+static bool gu_lookup_elf_symbol(struct per_elf_ctx *elf_ctx,
+				 unsigned long lookup_relative_pc,
+				 char **sym, uint64_t *func_offset)
+{
+	struct interval_array_item sym_item = { .private = NULL };
+	char *symbol;
+	int ret;
+
+	if (sym)
+		*sym = NULL;
+	if (func_offset)
+		*func_offset = 0;
+	if (!elf_ctx || !elf_ctx->symbols)
+		return false;
+
+	ret = gu_interval_array_search(elf_ctx->symbols, lookup_relative_pc,
+				       &sym_item);
+	if (ret < 0)
+		return false;
+
+	symbol = (char *)get_interval_array_pointer(
+		(uint64_t)sym_item.private, NULL);
+	if (!symbol)
+		return false;
+
+	if (sym)
+		*sym = symbol;
+	if (func_offset)
+		*func_offset = lookup_relative_pc - sym_item.start;
+	return true;
 }
 
 static bool gu_stack_snapshot_read_u64(struct gu_stack_info *info,
@@ -1865,17 +2332,18 @@ static bool gu_frame_pointer_sane(uint64_t bp, uint64_t next_bp)
 static bool gu_append_pc_frame(struct gu_context *ctx,
 			       struct per_pid_ctx **pid_ctx,
 			       struct gu_stack_info *info, uint64_t pc,
+			       bool initial_frame, bool signal_frame,
 			       struct interval_array_item *elf_item,
 			       bool *maps_reloaded,
 			       gu_frame_callback_t callback, void *user_ctx,
 			       bool *end_of_stack)
 {
 	struct gu_frame_record *stack_frame = &ctx->frame_record;
-	struct interval_array_item sym_item = { .private = NULL };
 	struct per_elf_ctx *elf_ctx = NULL;
 	unsigned long map_exec_virt_addr = 0;
 	unsigned long bias;
 	unsigned long relative_pc;
+	unsigned long lookup_relative_pc;
 	int ret;
 
 	if (!callback || pc == 0)
@@ -1903,19 +2371,19 @@ static bool gu_append_pc_frame(struct gu_context *ctx,
 
 	bias = elf_item->start - map_exec_virt_addr;
 	relative_pc = pc - bias;
+	/*
+	 * A return address points one past the call instruction; resolve
+	 * it against the preceding byte so a call landing exactly at a
+	 * function end still attributes to the caller.
+	 */
+	lookup_relative_pc = gu_frame_lookup_pc_for_return_address(
+		relative_pc, initial_frame, signal_frame);
 
 	stack_frame->elf_info = (struct gu_elf_info *)elf_ctx;
 	stack_frame->pc = relative_pc;
 	stack_frame->abs_pc = pc;
-	if (elf_ctx->symbols) {
-		ret = gu_interval_array_search(elf_ctx->symbols, relative_pc,
-					       &sym_item);
-		if (ret >= 0) {
-			stack_frame->symbol = (char *)get_interval_array_pointer(
-				(uint64_t)sym_item.private, NULL);
-			stack_frame->offset = relative_pc - sym_item.start;
-		}
-	}
+	gu_lookup_elf_symbol(elf_ctx, lookup_relative_pc,
+			    &stack_frame->symbol, &stack_frame->offset);
 
 	callback(stack_frame, user_ctx);
 	if (end_of_stack && is_stack_bottom_symbol(stack_frame->symbol))
@@ -1944,7 +2412,7 @@ static int gu_unwind_dwarf_tail_by_fp(struct gu_context *ctx,
 		return 0;
 
 	if (append_current_pc &&
-	    gu_append_pc_frame(ctx, pid_ctx, info, pc, &elf_item,
+	    gu_append_pc_frame(ctx, pid_ctx, info, pc, true, false, &elf_item,
 			       &maps_reloaded, callback, user_ctx,
 			       &end_of_stack)) {
 		appended++;
@@ -1965,8 +2433,8 @@ static int gu_unwind_dwarf_tail_by_fp(struct gu_context *ctx,
 			break;
 
 		end_of_stack = false;
-		if (!gu_append_pc_frame(ctx, pid_ctx, info, next_pc, &elf_item,
-					&maps_reloaded, callback, user_ctx,
+		if (!gu_append_pc_frame(ctx, pid_ctx, info, next_pc, false, false,
+					&elf_item, &maps_reloaded, callback, user_ctx,
 					&end_of_stack))
 			break;
 
@@ -2177,16 +2645,18 @@ int gu_unwind(struct gu_context *ctx, struct gu_stack_info *info, gu_frame_callb
 		return gu_unwind_by_fp(pid_ctx, info, callback, user_ctx);
 
 	struct interval_array_item elf_item = { 0, 0, NULL };
-	struct interval_array_item sym_item = { .private = NULL };
 	struct per_elf_ctx *elf_ctx = NULL;
 	unsigned long map_exec_virt_addr = 0;
 	Dwarf_Frame *frame = NULL;
 	bool maps_reloaded = false;
 
 	unsigned long pc, sp, raw_sp, relative_pc, func_offset, bias;
+	unsigned long lookup_relative_pc;
 	int ret = 0, regno = 0, loop_count = 0;
 	bool current_signal_frame = false;
 	bool fp_tail_append_current_pc = false;
+	unsigned long prev_sp = 0;
+	unsigned long prev_pc = 0;
 
 	int pc_regno = reg_name_rip;
 
@@ -2202,6 +2672,7 @@ int gu_unwind(struct gu_context *ctx, struct gu_stack_info *info, gu_frame_callb
 	GU_VERBOSE("backtrace started");
 
 	raw_sp = sp;
+	prev_sp = sp;
 
 	int max_backtrace_level = 512;
 
@@ -2240,17 +2711,10 @@ int gu_unwind(struct gu_context *ctx, struct gu_stack_info *info, gu_frame_callb
 		char *sym = NULL;
 		uint64_t func_offset = 0;
 
-		if (elf_ctx->symbols) {
-			sym_item.private = NULL;
-			ret = gu_interval_array_search(elf_ctx->symbols, relative_pc, &sym_item);
-			if (ret >= 0) {
-				sym = (char *)get_interval_array_pointer((uint64_t)sym_item.private, NULL);
-				func_offset = relative_pc - sym_item.start;
-			} else {
-				sym = NULL;
-				func_offset = 0;
-			}
-		}
+		lookup_relative_pc = gu_frame_lookup_pc_for_return_address(
+			relative_pc, initial_frame, current_signal_frame);
+		gu_lookup_elf_symbol(elf_ctx, lookup_relative_pc, &sym,
+				     &func_offset);
 
 		stack_frame->elf_info = (struct gu_elf_info *)elf_ctx;
 		stack_frame->flags = 0;
@@ -2332,6 +2796,23 @@ int gu_unwind(struct gu_context *ctx, struct gu_stack_info *info, gu_frame_callb
 			reason = GU_UNWIND_REASON_END_OF_STACK;
 			break;
 		}
+
+		/*
+		 * Loop guard: a valid caller frame always sits at a higher
+		 * stack address, so the unwound SP must strictly increase, and
+		 * the return address must differ from the frame we just
+		 * emitted.  When CFI is read from the wrong on-disk copy of a
+		 * replaced ("(deleted)") library, the RA column can resolve to
+		 * a stack slot holding a constant, producing the same PC every
+		 * step while SP still creeps upward - an endless run of
+		 * identical frames up to the depth cap.
+		 */
+		if (sp <= prev_sp || pc == prev_pc) {
+			reason = GU_UNWIND_REASON_NO_PROGRESS;
+			break;
+		}
+		prev_sp = sp;
+		prev_pc = pc;
 
 		write_regs(info, reg_name_rsp, sp);
 		write_regs(info, pc_regno, pc);

@@ -70,6 +70,11 @@ enum {
  * @end:        Ending virtual address of the mapping.
  * @offset:     File offset backing the mapping.
  * @permission: Memory permissions (combination of PERMISSION_* flags).
+ * @deleted:    True if the pathname carried the " (deleted)" suffix in
+ *              /proc/<pid>/maps, meaning the file was unlinked (and possibly
+ *              replaced) after the process mapped it.  The stored path has
+ *              the suffix stripped, so callers must not assume the on-disk
+ *              file still matches the mapped bytes.
  */
 struct maps_info {
 	char *path;
@@ -77,6 +82,7 @@ struct maps_info {
 	uint64_t end;
 	uint64_t offset;
 	char permission;
+	bool deleted;
 };
 
 /**
