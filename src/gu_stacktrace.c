@@ -2766,6 +2766,15 @@ int gu_unwind(struct gu_context *ctx, struct gu_stack_info *info, gu_frame_callb
 		unsigned long _ra, _sp, _bp;
 
 		reason = gen_reg(frame, pc_regno, bias, raw_sp, info, &_ra);
+		if (reason != GU_UNWIND_REASON_OK) {
+			/*
+			 * Innermost leaf frames can leave the return-address register
+			 * undefined in CFI while the hardware link register still holds
+			 * the caller address; use the sampled register only there.
+			 */
+			if (initial_frame && get_regs(info, pc_regno, &_ra))
+				reason = GU_UNWIND_REASON_OK;
+		}
 		if (reason != GU_UNWIND_REASON_OK)
 			break;
 

@@ -18,6 +18,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ptrace.h>
+#include <sys/uio.h>
+#include <elf.h>
+#ifdef __aarch64__
+#include <asm/ptrace.h>
+#endif
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/user.h>
@@ -27,9 +32,17 @@
 #include "gunwinder/unwinder.h"
 
 #define STACK_SNAPSHOT_SIZE (32 * 1024)
+#ifdef __aarch64__
+/* DWARF register numbers, matching include/arch/arm64/arch.h. */
+#define REGMAP_RBP 29
+#define REGMAP_RSP 31
+#define REGMAP_RIP 32
+#define REGMAP_LR  30
+#else
 #define REGMAP_RBP 6
 #define REGMAP_RSP 7
 #define REGMAP_RIP 16
+#endif
 
 struct symbol_hits {
 	int hot_leaf;
@@ -113,7 +126,11 @@ static int unwind_stopped_child(pid_t pid, struct symbol_hits *hits)
 	struct gu_init_cfg cfg = { 0 };
 	struct gu_context *ctx = NULL;
 	struct gu_stack_info info;
+	#ifdef __aarch64__
+	uint64_t regs[34] = { 0 };
+	#else
 	uint64_t regs[32] = { 0 };
+	#endif
 	unsigned char *stack = NULL;
 	struct user_regs_struct user_regs;
 	int status = 0;
@@ -128,6 +145,20 @@ static int unwind_stopped_child(pid_t pid, struct symbol_hits *hits)
 		return 1;
 	}
 
+	#ifdef __aarch64__
+	struct user_pt_regs arm_regs;
+	struct iovec iov = { .iov_base = &arm_regs, .iov_len = sizeof(arm_regs) };
+	lrc = ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &iov);
+	if (lrc < 0) {
+		perror("PTRACE_GETREGSET");
+		return 1;
+	}
+	regs[REGMAP_RBP] = arm_regs.regs[29];
+	regs[REGMAP_RSP] = arm_regs.sp;
+	regs[REGMAP_RIP] = arm_regs.pc;
+	regs[REGMAP_LR]  = arm_regs.regs[30];
+	#define USER_REGS_SP arm_regs.sp
+	#else
 	lrc = ptrace(PTRACE_GETREGS, pid, NULL, &user_regs);
 	if (lrc < 0) {
 		perror("PTRACE_GETREGS");
@@ -137,12 +168,14 @@ static int unwind_stopped_child(pid_t pid, struct symbol_hits *hits)
 	regs[REGMAP_RBP] = user_regs.rbp;
 	regs[REGMAP_RSP] = user_regs.rsp;
 	regs[REGMAP_RIP] = user_regs.rip;
+	#define USER_REGS_SP user_regs.rsp
+	#endif
 
 	stack = calloc(1, STACK_SNAPSHOT_SIZE);
 	if (!stack)
 		return 1;
 
-	start = user_regs.rsp & ~(unsigned long)(getpagesize() - 1);
+	start = (USER_REGS_SP) & ~(unsigned long)(getpagesize() - 1);
 	snprintf(mem_path, sizeof(mem_path), "/proc/%d/mem", pid);
 	fd_mem = open(mem_path, O_RDONLY | O_CLOEXEC);
 	if (fd_mem < 0) {

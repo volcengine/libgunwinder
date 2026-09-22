@@ -1533,13 +1533,19 @@ int gu_cfi_parse_cfi_ex(struct gu_cfi *cfi, uint64_t pc,
 		memcpy(ops_arr[REG_TYPE_RSP].ops, ops, ops_size * sizeof(Dwarf_Op));
 	}
 
-	// must, if not has RIP, direct return error.
+	/*
+	 * The return-address register can be unspecified/undefined for the
+	 * innermost leaf frame (it is kept live in the hardware link register).
+	 * That is not a decode failure; CFA/CFA-relative rules remain valid and
+	 * the caller falls back to the register snapshot for that frame.
+	 */
 	ops = gu_cfi_get_regs_ops(cfi, REG_TYPE_RIP, &calc_ctx, fde, &ops_size);
-	if (ops == NULL)
-		return -1;
-
-	ops_arr[REG_TYPE_RIP].ops_size = ops_size;
-	memcpy(ops_arr[REG_TYPE_RIP].ops, ops, ops_size * sizeof(Dwarf_Op));
+	if (ops != NULL) {
+		ops_arr[REG_TYPE_RIP].ops_size = ops_size;
+		memcpy(ops_arr[REG_TYPE_RIP].ops, ops, ops_size * sizeof(Dwarf_Op));
+	} else {
+		ops_arr[REG_TYPE_RIP].ops_size = 0;
+	}
 
 	// may not need, direct give up.
 	ops = gu_cfi_get_regs_ops(cfi, REG_TYPE_RBP, &calc_ctx, fde, &ops_size);
