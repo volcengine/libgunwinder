@@ -18,6 +18,8 @@
  * copying the upstream implementation.
  */
 
+#include <string.h>
+
 #include "gu_cfi_helper.h"
 #include "gu_stacktrace.h"
 #include "uthash.h"
@@ -168,6 +170,21 @@ static int get_encoding_size(unsigned int type, const unsigned char *test_buf)
 	return 0;
 }
 
+/* .eh_frame data is byte-aligned: read fixed-size fields through memcpy. */
+#define DEFINE_READ_UNALIGNED(type)					\
+	static inline type read_unaligned_##type(const unsigned char *p)	\
+	{								\
+		type v;							\
+		memcpy(&v, p, sizeof(v));				\
+		return v;						\
+	}
+DEFINE_READ_UNALIGNED(uint16_t)
+DEFINE_READ_UNALIGNED(uint32_t)
+DEFINE_READ_UNALIGNED(uint64_t)
+DEFINE_READ_UNALIGNED(int16_t)
+DEFINE_READ_UNALIGNED(int32_t)
+DEFINE_READ_UNALIGNED(int64_t)
+
 static const unsigned char *decode_read(const unsigned char *buf, unsigned int type, unsigned long *res)
 {
 	int size = 0;
@@ -181,31 +198,31 @@ static const unsigned char *decode_read(const unsigned char *buf, unsigned int t
 		buf = buf + size;
 		break;
 	case DW_EH_PE_udata2:
-		*res = *((uint16_t *)buf);
+		*res = (unsigned long)read_unaligned_uint16_t(buf);
 		buf = buf + 2;
 		break;
 	case DW_EH_PE_udata4:
-		*res = *((uint32_t *)buf);
+		*res = (unsigned long)read_unaligned_uint32_t(buf);
 		buf = buf + 4;
 		break;
 	case DW_EH_PE_udata8:
-		*res = *((uint64_t *)buf);
+		*res = (unsigned long)read_unaligned_uint64_t(buf);
 		buf = buf + 8;
 		break;
 	case DW_EH_PE_absptr:
-		*res = *((uint64_t *)buf);
+		*res = (unsigned long)read_unaligned_uint64_t(buf);
 		buf = buf + 8;
 		break;
 	case DW_EH_PE_sdata2:
-		*res = *((int16_t *)buf);
+		*res = (unsigned long)read_unaligned_int16_t(buf);
 		buf = buf + 2;
 		break;
 	case DW_EH_PE_sdata4:
-		*res = *((int32_t *)buf);
+		*res = (unsigned long)read_unaligned_int32_t(buf);
 		buf = buf + 4;
 		break;
 	case DW_EH_PE_sdata8:
-		*res = *((int64_t *)buf);
+		*res = (unsigned long)read_unaligned_int64_t(buf);
 		buf = buf + 8;
 		break;
 	default:

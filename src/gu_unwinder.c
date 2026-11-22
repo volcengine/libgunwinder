@@ -252,7 +252,7 @@ static bool fast_dwarf_ops_eval(const Dwarf_Op *ops, size_t nops,
 
 static int compare(const void *key, const void *val)
 {
-	Dwarf_Word offset = (uintptr_t)key;
+	Dwarf_Word offset = *(const Dwarf_Word *)key;
 	const Dwarf_Op *op = val;
 	return (offset > op->offset) - (offset < op->offset);
 }
@@ -542,7 +542,7 @@ bool gu_dwarf_ops_eval(Dwarf_Frame *frame, const Dwarf_Op *ops, size_t nops,
 			Dwarf_Word offset =
 				op->offset + 1 + 2 + (int16_t)op->number;
 			const Dwarf_Op *found =
-				bsearch((void *)(uintptr_t)offset, ops, nops,
+				bsearch(&offset, ops, nops,
 					sizeof(*ops), compare);
 			if (found == NULL)
 				goto failed;
