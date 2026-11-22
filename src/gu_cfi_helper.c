@@ -1463,10 +1463,10 @@ int gu_cfi_get_ops(enum cfi_reg_type type, Dwarf_Op **ops, int *ops_size, bool c
 
 int gu_cfi_parse_cfi(struct gu_cfi *cfi, uint64_t pc)
 {
-	return gu_cfi_parse_cfi_ex(cfi, pc, NULL);
+	return gu_cfi_parse_cfi_ex(cfi, pc, false, NULL);
 }
 
-int gu_cfi_parse_cfi_ex(struct gu_cfi *cfi, uint64_t pc,
+int gu_cfi_parse_cfi_ex(struct gu_cfi *cfi, uint64_t pc, bool initial_frame,
 			bool *signal_frame)
 {
 	GU_VERBOSE("cfi parse cfi start, try find pc %lx", pc);
@@ -1534,18 +1534,31 @@ int gu_cfi_parse_cfi_ex(struct gu_cfi *cfi, uint64_t pc,
 	}
 
 	/*
-	 * The return-address register can be unspecified/undefined for the
-	 * innermost leaf frame (it is kept live in the hardware link register).
-	 * That is not a decode failure; CFA/CFA-relative rules remain valid and
-	 * the caller falls back to the register snapshot for that frame.
+	 * The return-address column can be unspecified, undefined or same value
+	 * when the callee never spilled the return-address register: a leaf
+	 * keeps it live (the link register on arm64).  Only for the sampled
+	 * frame does that register still hold the caller's return address, so
+	 * only there read it from the register; on any deeper frame the walk
+	 * has rewritten that register with a frame's pc, and an unspecified
+	 * rule is the end of the stack.  On x86 a call always pushes the return
+	 * address, so the FDE always has a rule and this path is not taken.
 	 */
+	bool rip_from_live_ra = false;
 	ops = gu_cfi_get_regs_ops(cfi, REG_TYPE_RIP, &calc_ctx, fde, &ops_size);
-	if (ops != NULL) {
-		ops_arr[REG_TYPE_RIP].ops_size = ops_size;
-		memcpy(ops_arr[REG_TYPE_RIP].ops, ops, ops_size * sizeof(Dwarf_Op));
-	} else {
-		ops_arr[REG_TYPE_RIP].ops_size = 0;
+	if (ops == NULL) {
+		if (!initial_frame)
+			return -1;
+		static_ops[0] = (Dwarf_Op){
+			.atom = DW_OP_regx,
+			.number = fde->cie->return_address_register,
+		};
+		ops = static_ops;
+		ops_size = 1;
+		rip_from_live_ra = true;
 	}
+
+	ops_arr[REG_TYPE_RIP].ops_size = ops_size;
+	memcpy(ops_arr[REG_TYPE_RIP].ops, ops, ops_size * sizeof(Dwarf_Op));
 
 	// may not need, direct give up.
 	ops = gu_cfi_get_regs_ops(cfi, REG_TYPE_RBP, &calc_ctx, fde, &ops_size);
@@ -1554,7 +1567,13 @@ int gu_cfi_parse_cfi_ex(struct gu_cfi *cfi, uint64_t pc,
 		memcpy(ops_arr[REG_TYPE_RBP].ops, ops, ops_size * sizeof(Dwarf_Op));
 	}
 
-	gu_cfi_parse_cache_store(cfi, pc, fde->cie->signal_frame);
+	/*
+	 * The register rule above holds for the sampled frame only; caching it
+	 * would hand a stale return address to a later lookup of this pc as a
+	 * deeper frame.
+	 */
+	if (!rip_from_live_ra)
+		gu_cfi_parse_cache_store(cfi, pc, fde->cie->signal_frame);
 
 	return 0;
 }

@@ -142,7 +142,7 @@ struct gu_cfi *gu_cfi_init(struct per_elf_ctx *info);
 void gu_cfi_destroy(struct gu_cfi *cfi);
 
 int gu_cfi_parse_cfi(struct gu_cfi *cfi, uint64_t pc);
-int gu_cfi_parse_cfi_ex(struct gu_cfi *cfi, uint64_t pc,
+int gu_cfi_parse_cfi_ex(struct gu_cfi *cfi, uint64_t pc, bool initial_frame,
 			bool *signal_frame);
 
 int gu_cfi_get_ops(enum cfi_reg_type type, Dwarf_Op **ops, int *ops_size, bool cfa);
