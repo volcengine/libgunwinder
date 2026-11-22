@@ -33,7 +33,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential clang binutils-dev libelf-dev libdw-dev libssl-dev \
-            libiberty-dev libzstd-dev zlib1g-dev
+            libiberty-dev libzstd-dev zlib1g-dev python3-pytest
 
       - name: Build
         run: |

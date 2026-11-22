@@ -5,3 +5,4 @@ obj
 lib
 bin
 *.o
+__pycache__/

@@ -45,9 +45,16 @@ all: $(STATIC_LIB) $(SHARED_LIB) $(TOOL_BINS) bin/libdeep.so
 TEST_BINS = bin/test_zero_size_func_lookup bin/cfi_stress \
 	bin/test_symbol_resolution bin/test_stable_fp_miss_reload
 
-# Every test tool, one after another; the first failure stops the run.
+PYTEST ?= python3 -m pytest
+
+# The standalone test tools one after another (the first failure stops the
+# run), then the case-driven tests under tests/ (they build what they run).
+# The standalone tools go through gu_init()/gu_cleanup() and keep the leak
+# check; the cases do not (see tests/conftest.py).
 tests: all
 	$(Q)set -e; for t in $(TEST_BINS); do echo "  TEST    $$t"; $$t; done
+	$(Q)echo "  PYTEST  tests"
+	$(Q)$(PYTEST) -q -p no:cacheprovider tests
 
 # -MMD: an object also depends on the headers it includes, so a changed
 # struct rebuilds every object that lays it out.
