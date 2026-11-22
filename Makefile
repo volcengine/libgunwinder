@@ -27,16 +27,20 @@ else
 Q = @
 endif
 
+LDLIBS_common = -lelf -ldw -lzstd -lssl -lcrypto -liberty -lm -pthread -ldl
+
 SRCS = $(wildcard src/*.c)
 OBJS = $(patsubst src/%.c,obj/%.o,$(SRCS))
 
-TOOL_SRCS = $(wildcard tools/*.c)
+# libdeep.c is a shared-library fixture for test_stable_fp_miss_reload (no
+# main): it is built as bin/libdeep.so, not as an executable.
+TOOL_SRCS = $(filter-out tools/libdeep.c,$(wildcard tools/*.c))
 TOOL_BINS = $(patsubst tools/%.c,bin/%,$(TOOL_SRCS))
 
 STATIC_LIB = lib/libgunwinder.a
 SHARED_LIB = lib/libgunwinder.so
 
-all: $(STATIC_LIB) $(SHARED_LIB) $(TOOL_BINS)
+all: $(STATIC_LIB) $(SHARED_LIB) $(TOOL_BINS) bin/libdeep.so
 
 TEST_BINS = bin/test_zero_size_func_lookup bin/cfi_stress \
 	bin/test_symbol_resolution bin/test_stable_fp_miss_reload
@@ -67,7 +71,24 @@ $(SHARED_LIB): $(OBJS) Makefile
 bin/%: tools/%.c $(STATIC_LIB)
 	@mkdir -p $(dir $@)
 	$(Q)echo "  CC      $@"
-	$(Q)$(CC) $(CFLAGS_common) $< -o $@ $(STATIC_LIB) -lelf -ldw -lssl -lcrypto -liberty -lm -pthread
+	$(Q)$(CC) $(CFLAGS_common) $< -o $@ $(STATIC_LIB) $(LDLIBS_common)
+
+# The instance check races the maps read: both are wrapped (see the test).
+bin/test_identity_race: tools/test_identity_race.c $(STATIC_LIB)
+	@mkdir -p $(dir $@)
+	$(Q)echo "  CC      $@"
+	$(Q)$(CC) $(CFLAGS_common) $< -o $@ $(STATIC_LIB) -Wl,--wrap=gu_get_maps_info,--wrap=fopen $(LDLIBS_common)
+
+# One allocation can be made to fail (see the test).
+bin/test_debuginfo_mem: tools/test_debuginfo_mem.c $(STATIC_LIB)
+	@mkdir -p $(dir $@)
+	$(Q)echo "  CC      $@"
+	$(Q)$(CC) $(CFLAGS_common) $< -o $@ $(STATIC_LIB) -Wl,--wrap=realloc $(LDLIBS_common)
+
+bin/libdeep.so: tools/libdeep.c
+	@mkdir -p $(dir $@)
+	$(Q)echo "  CC      $@"
+	$(Q)$(CC) $(CFLAGS_common) -shared $< -o $@
 
 
 install: all

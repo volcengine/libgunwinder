@@ -9,8 +9,10 @@
 #include <time.h>
 #include <math.h>
 #include <unistd.h>
+#include <limits.h>
 #include <libiberty/demangle.h>
 #include "../src/gu_comm.h"
+#include "../src/gu_elf.h"
 #include "../src/gu_stacktrace.h"
 #include "../src/gu_unwinder.h"
 
@@ -475,7 +477,7 @@ static void print_dump_header(const char *file_name, enum gu_debug_dump_version_
 	const char *version_str = version == GU_DEBUG_DUMP_VERSION_V2 ? "v2" : "v1";
 
 	if (info->regs && get_regs(info, reg_name_rsp, &raw_sp)) {
-		stack_start = raw_sp - (raw_sp % getpagesize());
+		stack_start = raw_sp & ~((uint64_t)GU_STACK_DATA_ALIGN - 1);
 		stack_end = stack_start + info->stack_size;
 	}
 
@@ -556,6 +558,203 @@ static char *get_parent_dir(const char *path)
 
 static bool updated = false;
 
+struct bt_debug_hugepage_text_recovery {
+	bool enabled;
+	char path[PATH_MAX];
+	struct gu_elf_exec_ranges exec_ranges;
+	unsigned long load_bias;
+};
+
+static void bt_debug_hugepage_text_recovery_destroy(
+	struct bt_debug_hugepage_text_recovery *recovery)
+{
+	if (!recovery)
+		return;
+
+	gu_elf_exec_ranges_destroy(&recovery->exec_ranges);
+	memset(recovery, 0, sizeof(*recovery));
+}
+
+static int parse_bt_debug_maps_line(const char *line, unsigned long *start,
+				    unsigned long *end, char perm[5],
+				    char *map_path, size_t map_path_size)
+{
+	unsigned long offset;
+	int fields;
+
+	if (!line || !start || !end || !perm || !map_path ||
+	    map_path_size == 0)
+		return -1;
+
+	map_path[0] = '\0';
+	fields = sscanf(line, "%lx-%lx %4s %lx %*s %*s %4095s", start, end,
+			perm, &offset, map_path);
+	return fields >= 4 ? 0 : -1;
+}
+
+static int write_bt_debug_maps_line_with_path(FILE *output_file,
+					      const char *line,
+					      const char *replacement_path)
+{
+	const char *cursor = line;
+
+	if (!output_file || !line || !replacement_path)
+		return -1;
+
+	for (int field = 0; field < 5; field++) {
+		while (*cursor == ' ' || *cursor == '\t')
+			cursor++;
+		if (*cursor == '\0' || *cursor == '\n')
+			return -1;
+		while (*cursor != '\0' && *cursor != '\n' &&
+		       *cursor != ' ' && *cursor != '\t')
+			cursor++;
+	}
+
+	return fprintf(output_file, "%.*s %s\n", (int)(cursor - line),
+		       line, replacement_path) < 0 ? -1 : 0;
+}
+
+static bool bt_debug_hugepage_text_recovery_match(
+	const struct bt_debug_hugepage_text_recovery *recovery,
+	unsigned long start, unsigned long end, const char *map_path)
+{
+	unsigned long virt_start, virt_end;
+
+	if (!recovery || !recovery->enabled || end <= start ||
+	    !gu_maps_path_is_anonymous_exec_candidate(map_path))
+		return false;
+
+	if (start < recovery->load_bias || end < recovery->load_bias)
+		return false;
+
+	virt_start = start - recovery->load_bias;
+	virt_end = end - recovery->load_bias;
+
+	return gu_elf_exec_ranges_find(&recovery->exec_ranges, virt_start,
+				       virt_end, NULL);
+}
+
+static bool bt_debug_hugepage_text_recovery_try_path(
+	struct bt_debug_hugepage_text_recovery *recovery, const char *path,
+	unsigned long first_exec_start, unsigned long first_exec_end,
+	const char *first_exec_path)
+{
+	struct gu_elf_exec_ranges ranges = { 0 };
+	unsigned long first_exec_virt_addr;
+	unsigned long load_bias;
+	bool ok = false;
+
+	if (!recovery || !path || !first_exec_path)
+		return false;
+
+	if (gu_elf_exec_ranges_load(path, &ranges) != 0 || ranges.count == 0)
+		return false;
+
+	first_exec_virt_addr = gu_elf_exec_ranges_first_start(&ranges);
+	if (first_exec_start < first_exec_virt_addr)
+		goto out;
+
+	load_bias = first_exec_start - first_exec_virt_addr;
+	recovery->load_bias = load_bias;
+	recovery->exec_ranges = ranges;
+	recovery->enabled = true;
+	ok = bt_debug_hugepage_text_recovery_match(
+		recovery, first_exec_start, first_exec_end, first_exec_path);
+	if (!ok) {
+		recovery->enabled = false;
+		memset(&recovery->exec_ranges, 0,
+		       sizeof(recovery->exec_ranges));
+		goto out;
+	}
+
+	snprintf(recovery->path, sizeof(recovery->path), "%s", path);
+	return true;
+
+out:
+	gu_elf_exec_ranges_destroy(&ranges);
+	return false;
+}
+
+static void bt_debug_hugepage_text_recovery_init(
+	FILE *maps_file, const char *parent_dir,
+	struct bt_debug_hugepage_text_recovery *recovery)
+{
+	char *line = NULL;
+	size_t len = 0;
+	bool saw_first_exec = false;
+	bool first_exec_anonymous = false;
+	unsigned long first_exec_start = 0;
+	unsigned long first_exec_end = 0;
+	char first_exec_path[PATH_MAX] = { 0 };
+
+	if (!maps_file || !parent_dir || !recovery)
+		return;
+
+	memset(recovery, 0, sizeof(*recovery));
+
+	while (getline(&line, &len, maps_file) != -1) {
+		unsigned long start = 0, end = 0;
+		char perm[5] = { 0 };
+		char map_path[PATH_MAX] = { 0 };
+
+		if (parse_bt_debug_maps_line(line, &start, &end, perm,
+					     map_path, sizeof(map_path)) != 0)
+			continue;
+
+		if (!saw_first_exec && perm[2] == 'x') {
+			saw_first_exec = true;
+			first_exec_start = start;
+			first_exec_end = end;
+			snprintf(first_exec_path, sizeof(first_exec_path), "%s",
+				 map_path);
+			first_exec_anonymous =
+				gu_maps_path_is_anonymous_exec_candidate(map_path);
+			if (!first_exec_anonymous)
+				break;
+		}
+	}
+
+	if (!first_exec_anonymous)
+		goto out;
+
+	rewind(maps_file);
+	while (getline(&line, &len, maps_file) != -1) {
+		unsigned long start = 0, end = 0;
+		char perm[5] = { 0 };
+		char map_path[PATH_MAX] = { 0 };
+		const char *binary_name;
+		char *local_path;
+
+		if (parse_bt_debug_maps_line(line, &start, &end, perm,
+					     map_path, sizeof(map_path)) != 0)
+			continue;
+		if (map_path[0] != '/')
+			continue;
+
+		binary_name = strrchr(map_path, '/');
+		binary_name = binary_name ? binary_name + 1 : map_path;
+		local_path = gu_path_join(parent_dir, binary_name);
+		if (!local_path)
+			continue;
+
+		if (access(local_path, R_OK) == 0 &&
+		    bt_debug_hugepage_text_recovery_try_path(
+			    recovery, local_path, first_exec_start,
+			    first_exec_end, first_exec_path)) {
+			free(local_path);
+			break;
+		}
+
+		free(local_path);
+	}
+
+out:
+	if (line)
+		free(line);
+	rewind(maps_file);
+}
+
 static int update_maps_paths(const char *path, struct gu_stack_info *info)
 {
 	FILE *maps_file = NULL, *output_file = NULL;
@@ -563,6 +762,7 @@ static int update_maps_paths(const char *path, struct gu_stack_info *info)
 	char *line = NULL, *token = NULL;
 	size_t len = 0;
 	char *parent_dir = NULL;
+	struct bt_debug_hugepage_text_recovery hugepage_text = { 0 };
 	int ret = -1;
 
 	info->unique_id = 0;
@@ -592,7 +792,30 @@ static int update_maps_paths(const char *path, struct gu_stack_info *info)
 	if (!output_file)
 		goto out;
 
+	bt_debug_hugepage_text_recovery_init(maps_file, parent_dir,
+					     &hugepage_text);
+
 	while (getline(&line, &len, maps_file) != -1) {
+		unsigned long start = 0, end = 0;
+		char perm[5] = { 0 };
+		char map_path[PATH_MAX] = { 0 };
+		bool is_exec = false;
+
+		if (parse_bt_debug_maps_line(line, &start, &end, perm,
+					     map_path, sizeof(map_path)) == 0)
+			is_exec = perm[2] == 'x';
+
+		if (is_exec &&
+		    bt_debug_hugepage_text_recovery_match(&hugepage_text, start,
+							  end, map_path)) {
+			if (write_bt_debug_maps_line_with_path(
+				    output_file, line, hugepage_text.path) != 0)
+				goto out;
+			GU_OUTPUT("hugepage optimize detected, replace anonymous executable segment [0x%lx-0x%lx] with %s\n",
+				  start, end, hugepage_text.path);
+			continue;
+		}
+
 		if ((token = strrchr(line, '/')) || (token = strstr(line, "[vdso]"))) {
 			char *binary_name = NULL;
 
@@ -658,6 +881,7 @@ out:
 		free(maps_path);
 	if (parent_dir)
 		free(parent_dir);
+	bt_debug_hugepage_text_recovery_destroy(&hugepage_text);
 	return ret;
 }
 
@@ -677,6 +901,8 @@ int stack_trace_from_dump(struct gu_context *ctx, const char *file_name, bool pr
 
 	if (dump_version == GU_DEBUG_DUMP_VER_ERROR) {
 		printf("get dump version failed\n");
+		free((void *)info->unique_id);
+		gu_free_stack_dump(info);
 		return -1;
 	}
 
@@ -722,10 +948,9 @@ int stack_trace_from_dump(struct gu_context *ctx, const char *file_name, bool pr
 		print_trace_summary("FP   ", info, &fp_output, elapsed_ns);
 	}
 
+	/* update_maps_paths() stores a malloc'd maps path in unique_id */
 	free((void *)info->unique_id);
-	free(info->stack_data);
-	free(info->regs);
-	free(info);
+	gu_free_stack_dump(info);
 
 	return 0;
 }

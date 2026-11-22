@@ -310,7 +310,11 @@ enum cfi_reg_type trans_reg_type(int regno)
 	}
 }
 
-bool _default_init = false;
+/*
+ * The default CIE state and the per-frame rule scratch below are per thread:
+ * several gu_contexts may unwind at once, each on its own thread.
+ */
+static __thread bool _default_init;
 
 /* arch */
 static const uint8_t _default_init_cfi[] = {
@@ -320,7 +324,7 @@ static const uint8_t _default_init_cfi[] = {
 	DW_CFA_same_value, 6, DW_CFA_val_offset, 7, 0,
 };
 
-static struct gu_cfi_calc_ctx _default_calc_ctx = { 0 };
+static __thread struct gu_cfi_calc_ctx _default_calc_ctx;
 
 void print_bytes(const uint8_t *ins_start, const uint8_t *ins_end)
 {
@@ -344,7 +348,11 @@ int init_calc_ctx_by_ins(struct gu_cfi *cfi, struct gu_cfi_cie *cie, struct gu_c
 {
 	const uint8_t *ins = ins_start;
 
-	bool in_cie = (ins_start == cie->initial_instructions);
+	/*
+	 * Not by address: the body of an FDE whose CIE has no initial
+	 * instructions starts where they would be.
+	 */
+	bool in_cie = (calc_ctx == &cie->cie_calc_ctx);
 	struct gu_cfi_calc_ctx *tmp_ctx;
 
 #define DECODE_CFI(TYPE, OUT) do { \
@@ -622,13 +630,160 @@ int init_calc_ctx_by_ins(struct gu_cfi *cfi, struct gu_cfi_cie *cie, struct gu_c
 	return 0;
 }
 
-static struct gu_cfi_cie *init_cie_from_buf(struct gu_cfi *cfi, Dwarf_Off cie_off, Dwarf_CIE *dwarf_cie)
+/*
+ * Builds the CFI of one ELF at load, see struct gu_cfi.  The section is
+ * read where libelf has it; only distinct instruction bytes are copied, into
+ * @pool, which becomes gu_cfi::cfi_data when the load is done.  The pool is
+ * sized for the whole section up front, so nothing that points into it
+ * moves while the load runs: the CIEs' initial instructions and the bodies
+ * are a subset of the section's bytes.
+ */
+struct gu_cfi_build_body {
+	struct gu_cfi_cie *cie;
+	uint64_t hash;
+	uint32_t off;
+	uint32_t len;
+};
+
+struct gu_cfi_builder {
+	Elf_Data *scn_data;
+	uint8_t *pool;
+	size_t pool_len;
+	size_t pool_cap;
+	struct gu_cfi_build_body *bodies;
+	size_t body_count;
+	size_t body_cap;
+	/* open addressing over @bodies: index + 1, 0 is empty */
+	uint32_t *slots;
+	size_t slot_count;
+	/*
+	 * An allocation failed: the table would miss FDEs, so the whole CFI
+	 * fails to load (a malformed entry still ends the table early).
+	 */
+	bool failed;
+};
+
+static void gu_cfi_builder_destroy(struct gu_cfi_builder *b)
+{
+	free(b->bodies);
+	free(b->slots);
+	b->bodies = NULL;
+	b->slots = NULL;
+}
+
+static uint64_t gu_cfi_body_hash(const struct gu_cfi_cie *cie,
+				 const uint8_t *ins, size_t len)
+{
+	uint64_t h = 14695981039346656037ULL ^ (uint64_t)(uintptr_t)cie;
+
+	for (size_t i = 0; i < len; i++) {
+		h ^= ins[i];
+		h *= 1099511628211ULL;
+	}
+	return h ^ (h >> 31);
+}
+
+static int gu_cfi_builder_grow_slots(struct gu_cfi_builder *b)
+{
+	size_t count = b->slot_count ? b->slot_count * 2 : 1024;
+	uint32_t *slots = calloc(count, sizeof(*slots));
+
+	if (!slots) {
+		b->failed = true;
+		return -1;
+	}
+	for (size_t i = 0; i < b->body_count; i++) {
+		size_t s = b->bodies[i].hash & (count - 1);
+
+		while (slots[s])
+			s = (s + 1) & (count - 1);
+		slots[s] = i + 1;
+	}
+	free(b->slots);
+	b->slots = slots;
+	b->slot_count = count;
+	return 0;
+}
+
+/* Copy [@ins, @ins + @len) into the pool; its offset there, or -1. */
+static long gu_cfi_builder_append(struct gu_cfi_builder *b, const uint8_t *ins,
+				  size_t len)
+{
+	size_t off = b->pool_len;
+
+	if (len > b->pool_cap - b->pool_len || off + len > UINT32_MAX) {
+		b->failed = true;
+		return -1;
+	}
+	memcpy(b->pool + off, ins, len);
+	b->pool_len += len;
+	return (long)off;
+}
+
+/* The index of the body of @cie with these instructions, added if new. */
+static long gu_cfi_builder_body(struct gu_cfi_builder *b,
+				struct gu_cfi_cie *cie, const uint8_t *ins,
+				size_t len)
+{
+	uint64_t hash = gu_cfi_body_hash(cie, ins, len);
+	struct gu_cfi_build_body *body;
+	long off;
+	size_t s;
+
+	if ((b->body_count + 1) * 2 > b->slot_count &&
+	    gu_cfi_builder_grow_slots(b) != 0)
+		return -1;
+
+	for (s = hash & (b->slot_count - 1); b->slots[s];
+	     s = (s + 1) & (b->slot_count - 1)) {
+		body = &b->bodies[b->slots[s] - 1];
+		if (body->hash == hash && body->cie == cie && body->len == len &&
+		    memcmp(b->pool + body->off, ins, len) == 0)
+			return b->slots[s] - 1;
+	}
+
+	if (b->body_count == b->body_cap) {
+		size_t cap = b->body_cap ? b->body_cap * 2 : 1024;
+		struct gu_cfi_build_body *bodies;
+
+		if (cap > UINT32_MAX - 1)
+			bodies = NULL;
+		else
+			bodies = realloc(b->bodies, cap * sizeof(*bodies));
+		if (!bodies) {
+			b->failed = true;
+			return -1;
+		}
+		b->bodies = bodies;
+		b->body_cap = cap;
+	}
+
+	off = gu_cfi_builder_append(b, ins, len);
+	if (off < 0)
+		return -1;
+
+	body = &b->bodies[b->body_count];
+	body->cie = cie;
+	body->hash = hash;
+	body->off = (uint32_t)off;
+	body->len = (uint32_t)len;
+	b->slots[s] = b->body_count + 1;
+	return b->body_count++;
+}
+
+static struct gu_cfi_cie *init_cie_from_buf(struct gu_cfi *cfi,
+					    struct gu_cfi_builder *b,
+					    Dwarf_Off cie_off,
+					    Dwarf_CIE *dwarf_cie)
 {
 	struct gu_cfi_cie *cie = NULL;
+	long ins_off;
 
 	cie = calloc(1, sizeof(struct gu_cfi_cie));
-	if (!cie)
+	if (!cie) {
+		b->failed = true;
 		return NULL;
+	}
 
 	cfi->cfi_mem_usage += sizeof(struct gu_cfi_cie);
 
@@ -637,8 +792,20 @@ static struct gu_cfi_cie *init_cie_from_buf(struct gu_cfi *cfi, Dwarf_Off cie_of
 	cie->code_alignment_factor = dwarf_cie->code_alignment_factor;
 	cie->data_alignment_factor = dwarf_cie->data_alignment_factor;
 	cie->return_address_register = dwarf_cie->return_address_register;
-	cie->initial_instructions = dwarf_cie->initial_instructions;
-	cie->initial_instructions_end = dwarf_cie->initial_instructions_end;
+
+	/*
+	 * Decode the pool's copy: an expression rule records its offset in
+	 * gu_cfi::cfi_data, which is the pool.
+	 */
+	ins_off = gu_cfi_builder_append(
+		b, dwarf_cie->initial_instructions,
+		dwarf_cie->initial_instructions_end - dwarf_cie->initial_instructions);
+	if (ins_off < 0) {
+		free(cie);
+		return NULL;
+	}
+	cie->initial_instructions = b->pool + ins_off;
+	cie->initial_instructions_end = b->pool + b->pool_len;
 
 	cie->fde_augmentation_data_size = 0;
 	cie->sized_augmentation_data = false;
@@ -701,26 +868,31 @@ static struct gu_cfi_cie *init_cie_from_buf(struct gu_cfi *cfi, Dwarf_Off cie_of
 	return cie;
 }
 
-// FDE
-static int init_fde_from_entry(struct gu_cfi *cfi, struct gu_cfi_fde *fde, Dwarf_CFI_Entry *entry)
+// FDE: its range into @item, the index of its body as the item's private
+static int init_fde_from_entry(struct gu_cfi *cfi, struct gu_cfi_builder *b,
+			       Dwarf_CFI_Entry *entry,
+			       struct interval_array_item *item)
 {
 	Dwarf_FDE *fde_dwarf = &entry->fde;
 	struct gu_cfi_cie *cie = NULL;
 	int ret = 0;
+	long body;
 
 	HASH_FIND_INT(cfi->cie_list, &fde_dwarf->CIE_pointer, cie);
 	if (!cie) {
 		Dwarf_Off off_cie = 0, next_off_cie = 0;
 		Dwarf_CFI_Entry entry_cie;
 		off_cie = fde_dwarf->CIE_pointer;
-		ret = dwarf_next_cfi(cfi->e_ident, cfi->cfi_data, cfi->eh_frame, off_cie, &next_off_cie, &entry_cie);
+		ret = dwarf_next_cfi(cfi->e_ident, b->scn_data, cfi->eh_frame, off_cie, &next_off_cie, &entry_cie);
 		if (ret != 0)
 			return ret;
 
 		if (entry_cie.cie.CIE_id != 0xffffffffffffffffULL)
 			return -1;
 
-		cie = init_cie_from_buf(cfi, off_cie, &entry_cie.cie);
+		cie = init_cie_from_buf(cfi, b, off_cie, &entry_cie.cie);
+		if (!cie)
+			return -1;
 		HASH_ADD_INT(cfi->cie_list, offset, cie);
 	}
 
@@ -748,25 +920,96 @@ static int init_fde_from_entry(struct gu_cfi *cfi, struct gu_cfi_fde *fde, Dwarf
 		buf += cie->fde_augmentation_data_size;
 	}
 
-	fde->cie = cie;
-	fde->instructions = buf;
-	fde->instructions_end = fde_dwarf->end;
-
 	if ((cie->fde_encoding & 0x70) == DW_EH_PE_pcrel)
-		pc = (((uint64_t)cfi->sh_off + (fde_dwarf->start - (const unsigned char *)cfi->cfi_data->d_buf) + (uint64_t)pc) & (0xffffffffffffffffUL));
+		pc = (((uint64_t)cfi->sh_off + (fde_dwarf->start - (const unsigned char *)b->scn_data->d_buf) + (uint64_t)pc) & (0xffffffffffffffffUL));
 
 	if (pc + size < pc)
 		return -1;
-	fde->start = pc;
-	fde->end = pc + size;
 
-	// GU_VERBOSE("FDE Init: PC [ %lx - %lx ] CIE pointer %p Ins [ %p - %p ]", fde->start, fde->end, fde->cie, fde->instructions, fde->instructions_end);
+	body = gu_cfi_builder_body(b, cie, buf, end - buf);
+	if (body < 0)
+		return -1;
+
+	item->start = pc;
+	item->end = pc + size;
+	item->private = (void *)(uintptr_t)body;
+
+	// GU_VERBOSE("FDE Init: PC [ %lx - %lx ] CIE pointer %p body %ld", pc, pc + size, cie, body);
 
 	return 0;
 }
 
+/*
+ * The load is done: move the distinct instructions to a buffer of their
+ * size, point the bodies and the CIEs at it and build the FDE table from
+ * the @count decoded @items.
+ */
+static int gu_cfi_builder_finish(struct gu_cfi *cfi, struct gu_cfi_builder *b,
+				 struct interval_array_item *items, int count)
+{
+	struct gu_cfi_cie *cie, *tmp;
+	uint8_t *pool;
+
+	pool = malloc(b->pool_len ? b->pool_len : 1);
+	if (!pool)
+		return -1;
+	memcpy(pool, b->pool, b->pool_len);
+
+	cfi->bodies = calloc(b->body_count ? b->body_count : 1, sizeof(*cfi->bodies));
+	if (!cfi->bodies) {
+		free(pool);
+		return -1;
+	}
+	cfi->body_count = b->body_count;
+	for (size_t i = 0; i < b->body_count; i++) {
+		cfi->bodies[i].cie = b->bodies[i].cie;
+		cfi->bodies[i].instructions = pool + b->bodies[i].off;
+		cfi->bodies[i].instructions_end =
+			pool + b->bodies[i].off + b->bodies[i].len;
+	}
+
+	HASH_ITER (hh, cfi->cie_list, cie, tmp) {
+		size_t off = cie->initial_instructions - b->pool;
+		size_t len = cie->initial_instructions_end - cie->initial_instructions;
+		struct gu_cfi_calc_ctx *rules = &cie->cie_calc_ctx;
+
+		cie->initial_instructions = pool + off;
+		cie->initial_instructions_end = pool + off + len;
+		/*
+		 * Decoding the initial instructions left the rules a CIE starts
+		 * every FDE with; all but a CFA expression keep offsets into
+		 * the pool, the expression its address.
+		 */
+		if (rules->cfa_rule == cfa_expr)
+			rules->cfa_data.expr.data =
+				pool + ((uint8_t *)rules->cfa_data.expr.data - b->pool);
+	}
+
+	free(b->pool);
+	b->pool = NULL;
+	cfi->cfi_data->d_buf = pool;
+	cfi->cfi_data->d_size = b->pool_len;
+
+	for (int i = 0; i < count; i++)
+		items[i].private = (void *)mark_interval_array_pointer_no_free(
+			(uint64_t)&cfi->bodies[(uintptr_t)items[i].private]);
+
+	cfi->hdr_interval_array = gu_interval_array_init(items, count);
+	if (cfi->hdr_interval_array == NULL)
+		return -1;
+
+	cfi->cfi_mem_usage += cfi->body_count * sizeof(*cfi->bodies);
+	cfi->cfi_mem_usage += count * (cfi->hdr_interval_array->type == INTERVAL_ARRAY_TYPE_U32 ?
+				       sizeof(struct interval_array_item_u32) :
+				       sizeof(struct interval_array_item_u64));
+	cfi->cfi_data_mem_usage += b->pool_len;
+	return 0;
+}
+
 #define HDR_VERSION 1
-static int gu_cfi_hdr_init_by_hdr(struct gu_cfi *cfi, const unsigned char *buf, size_t size, uint64_t eh_hdr_p_offset)
+static int gu_cfi_hdr_init_by_hdr(struct gu_cfi *cfi, struct gu_cfi_builder *b,
+				  const unsigned char *buf, size_t size,
+				  uint64_t eh_hdr_p_offset)
 {
 	const unsigned char *raw = buf;
 	const unsigned char *end = raw + size;
@@ -802,14 +1045,6 @@ static int gu_cfi_hdr_init_by_hdr(struct gu_cfi *cfi, const unsigned char *buf, 
 	if (!items)
 		return -1;
 
-	cfi->fdes = calloc(fde_count, sizeof(struct gu_cfi_fde));
-	if (!cfi->fdes) {
-		free(items);
-		return -1;
-	}
-
-	cfi->cfi_mem_usage += cfi->fde_count * sizeof(struct gu_cfi_fde);
-
 	int item_index = 0;
 
 	while (item_index < fde_count && buf < end) {
@@ -823,37 +1058,26 @@ static int gu_cfi_hdr_init_by_hdr(struct gu_cfi *cfi, const unsigned char *buf, 
 		Dwarf_CFI_Entry entry;
 
 		offset = addr - (eh_frame_ptr + 4);
-		int ret = dwarf_next_cfi(cfi->e_ident, cfi->cfi_data, cfi->eh_frame, offset, &next_off, &entry);
+		int ret = dwarf_next_cfi(cfi->e_ident, b->scn_data, cfi->eh_frame, offset, &next_off, &entry);
 		if (ret != 0)
 			break;
 
-		ret = init_fde_from_entry(cfi, &cfi->fdes[item_index], &entry);
+		ret = init_fde_from_entry(cfi, b, &entry, &items[item_index]);
 		if (ret != 0)
 			break;
 
-		struct gu_cfi_fde *fde = &cfi->fdes[item_index];
-
-		items[item_index].start = fde->start;
-		items[item_index].end = fde->end;
-		items[item_index].private = (void *)mark_interval_array_pointer_no_free((uint64_t)fde);
 		item_index++;
 	}
 
-	cfi->hdr_interval_array = gu_interval_array_init(items, item_index);
-	if (cfi->hdr_interval_array == NULL) {
-		free(items);
-		free(cfi->fdes);
-		return -1;
-	}
-
-	cfi->cfi_mem_usage += item_index * sizeof(struct interval_array_item);
+	int ret = b->failed ? -1 : gu_cfi_builder_finish(cfi, b, items, item_index);
 
 	free(items);
 
-	return 0;
+	return ret;
 }
 
-static int gu_cfi_hdr_init_by_scan(struct gu_cfi *cfi, bool is_eh)
+static int gu_cfi_hdr_init_by_scan(struct gu_cfi *cfi, struct gu_cfi_builder *b,
+				   bool is_eh)
 {
 	Dwarf_Off off = 0, next_off = 0;
 	Dwarf_CFI_Entry entry;
@@ -861,7 +1085,7 @@ static int gu_cfi_hdr_init_by_scan(struct gu_cfi *cfi, bool is_eh)
 
 	cfi->eh_frame = is_eh;
 
-	while ((ret = dwarf_next_cfi(cfi->e_ident, cfi->cfi_data, cfi->eh_frame, off, &next_off, &entry)) == 0) {
+	while ((ret = dwarf_next_cfi(cfi->e_ident, b->scn_data, cfi->eh_frame, off, &next_off, &entry)) == 0) {
 		if (entry.cie.CIE_id == 0xffffffffffffffffULL)
 			cie_count++;
 		else
@@ -873,49 +1097,34 @@ static int gu_cfi_hdr_init_by_scan(struct gu_cfi *cfi, bool is_eh)
 	if (!items)
 		return -1;
 
-	cfi->fdes = calloc(fde_count, sizeof(struct gu_cfi_fde));
-	if (!cfi->fdes) {
-		free(items);
-		return -1;
-	}
-
 	off = 0;
 	next_off = 0;
 
-	while ((ret = dwarf_next_cfi(cfi->e_ident, cfi->cfi_data, cfi->eh_frame, off, &next_off, &entry)) == 0) {
+	while ((ret = dwarf_next_cfi(cfi->e_ident, b->scn_data, cfi->eh_frame, off, &next_off, &entry)) == 0) {
 		if (entry.cie.CIE_id == 0xffffffffffffffffULL) {
 			off = next_off;
 			continue;
 		}
 
-		ret = init_fde_from_entry(cfi, &cfi->fdes[item_index], &entry);
+		ret = init_fde_from_entry(cfi, b, &entry, &items[item_index]);
 		if (ret != 0)
 			break;
 
-		struct gu_cfi_fde *fde = &cfi->fdes[item_index];
-
-		items[item_index].start = fde->start;
-		items[item_index].end = fde->end;
-		items[item_index].private = (void *)mark_interval_array_pointer_no_free((uint64_t)fde);
 		item_index++;
 
 		off = next_off;
 	}
 
-	cfi->hdr_interval_array = gu_interval_array_init(items, item_index);
-	if (cfi->hdr_interval_array == NULL) {
-		free(items);
-		free(cfi->fdes);
-		return -1;
-	}
+	ret = b->failed ? -1 : gu_cfi_builder_finish(cfi, b, items, item_index);
 
 	free(items);
 
-	return 0;
+	return ret;
 }
 
 static struct gu_cfi *gu_cfi_init_with_hdr(Elf *elf, Elf_Data *hdr_scn_data, Elf_Data *scn_data, uint64_t eh_hdr_p_offset, uint64_t frame_shoff, bool is_eh)
 {
+	struct gu_cfi_builder b = { .scn_data = scn_data };
 	struct gu_cfi *cfi = calloc(1, sizeof(struct gu_cfi));
 	if (!cfi)
 		return NULL;
@@ -933,40 +1142,35 @@ static struct gu_cfi *gu_cfi_init_with_hdr(Elf *elf, Elf_Data *hdr_scn_data, Elf
 	memcpy(cfi->e_ident, ident, size);
 	cfi->sh_off = frame_shoff;
 
-	cfi->cfi_data = malloc(sizeof(Elf_Data));
-	void *cfi_data_buf = malloc(scn_data->d_size);
-
-	memcpy(cfi_data_buf, scn_data->d_buf, scn_data->d_size);
+	cfi->cfi_data = calloc(1, sizeof(Elf_Data));
+	if (!cfi->cfi_data)
+		goto failed;
 	memcpy(cfi->cfi_data, scn_data, sizeof(Elf_Data));
-
 	cfi->cfi_mem_usage += sizeof(Elf_Data);
-	cfi->cfi_data_mem_usage += scn_data->d_size;
 
-	cfi->cfi_data->d_buf = cfi_data_buf;
+	/* owned through cfi->cfi_data from here on, see gu_cfi_builder_finish() */
+	b.pool_cap = scn_data->d_size;
+	b.pool = malloc(b.pool_cap ? b.pool_cap : 1);
+	cfi->cfi_data->d_buf = b.pool;
+	if (!b.pool)
+		goto failed;
 
 	if (hdr_scn_data != NULL) {
 		unsigned char *hdr_buf = hdr_scn_data->d_buf;
 		size_t hdr_size = hdr_scn_data->d_size;
-		if (gu_cfi_hdr_init_by_hdr(cfi, hdr_buf, hdr_size, eh_hdr_p_offset) != 0)
+		if (gu_cfi_hdr_init_by_hdr(cfi, &b, hdr_buf, hdr_size, eh_hdr_p_offset) != 0)
 			goto failed;
 	} else {
-		if (gu_cfi_hdr_init_by_scan(cfi, is_eh) != 0)
+		if (gu_cfi_hdr_init_by_scan(cfi, &b, is_eh) != 0)
 			goto failed;
 	}
 
+	gu_cfi_builder_destroy(&b);
 	return cfi;
 
 failed:
-	if (cfi) {
-		if (cfi->e_ident)
-			free(cfi->e_ident);
-		if (cfi->cfi_data) {
-			if (cfi->cfi_data->d_buf)
-				free(cfi->cfi_data->d_buf);
-			free(cfi->cfi_data);
-		}
-		free(cfi);
-	}
+	gu_cfi_builder_destroy(&b);
+	gu_cfi_destroy(cfi);
 
 	return NULL;
 }
@@ -1014,8 +1218,20 @@ struct gu_cfi *gu_cfi_init(struct per_elf_ctx *info)
 
 	scn_data = elf_rawdata(scn, NULL);
 
-	if (scn_type == ELF_SCN_TYPE_ZDWARF_FRAME || shdr.sh_flags & SHF_COMPRESSED)
-		elf_compress(scn, 0, 0);
+	/*
+	 * Two compressed formats: SHF_COMPRESSED sections carry an Elf_Chdr,
+	 * the older GNU .zdebug_* ones a "ZLIB" header and no flag (Go up to
+	 * 1.11, objcopy zlib-gnu).  elf_compress() only knows the first; fed a
+	 * .zdebug section it fails and the compressed bytes would be parsed as
+	 * CFI.  A section that does not decompress has no CFI to offer.
+	 */
+	if (shdr.sh_flags & SHF_COMPRESSED) {
+		if (elf_compress(scn, 0, 0) < 0)
+			return NULL;
+	} else if (scn_type == ELF_SCN_TYPE_ZDWARF_FRAME) {
+		if (elf_compress_gnu(scn, 0, 0) < 0)
+			return NULL;
+	}
 
 	scn_data = elf_getdata(scn, NULL);
 	if (scn_data == NULL)
@@ -1042,8 +1258,8 @@ void gu_cfi_destroy(struct gu_cfi *cfi)
 		free(cfi->cfi_data);
 	}
 
-	if (cfi->fdes)
-		free(cfi->fdes);
+	free(cfi->bodies);
+	free(cfi->parse_cache);
 	if (cfi->hdr_interval_array)
 		gu_interval_array_destroy(cfi->hdr_interval_array);
 	if (cfi->cie_list) {
@@ -1056,28 +1272,16 @@ void gu_cfi_destroy(struct gu_cfi *cfi)
 	free(cfi);
 }
 
-static Dwarf_Op static_ops[DWARF_OPS_MAX] = { 0 };
+static __thread Dwarf_Op static_ops[DWARF_OPS_MAX];
 
 struct backtrace_ops_info {
-	Dwarf_Op *ops;
+	Dwarf_Op ops[DWARF_OPS_MAX];
 	int ops_size;
 };
 
-static Dwarf_Op rip_ops[DWARF_OPS_MAX] = { 0 };
-static Dwarf_Op rbp_ops[DWARF_OPS_MAX] = { 0 };
-static Dwarf_Op rsp_ops[DWARF_OPS_MAX] = { 0 };
-static Dwarf_Op cfa_ops[DWARF_OPS_MAX] = { 0 };
-
-static struct backtrace_ops_info ops_arr[REG_TYPE_MAX] = {
-	[REG_TYPE_RIP] = { rip_ops, 0 },
-	[REG_TYPE_RBP] = { rbp_ops, 0 },
-	[REG_TYPE_RSP] = { rsp_ops, 0 },
-};
-
-struct backtrace_ops_info cfa_ops_info = {
-	.ops = cfa_ops,
-	.ops_size = 0,
-};
+/* The rules of the frame being decoded, one set per unwinding thread. */
+static __thread struct backtrace_ops_info ops_arr[REG_TYPE_MAX];
+static __thread struct backtrace_ops_info cfa_ops_info;
 
 static size_t gu_cfi_parse_cache_index(uint64_t pc)
 {
@@ -1101,9 +1305,11 @@ static void gu_cfi_cache_copy_to_scratch(const struct gu_cfi_cached_ops *cached,
 static bool gu_cfi_parse_cache_load(struct gu_cfi *cfi, uint64_t pc,
 				    bool *signal_frame)
 {
-	struct gu_cfi_parse_cache_entry *entry =
-		&cfi->parse_cache[gu_cfi_parse_cache_index(pc)];
+	struct gu_cfi_parse_cache_entry *entry;
 
+	if (!cfi->parse_cache)
+		return false;
+	entry = &cfi->parse_cache[gu_cfi_parse_cache_index(pc)];
 	if (!entry->valid || entry->pc != pc)
 		return false;
 
@@ -1135,6 +1341,12 @@ static void gu_cfi_parse_cache_store(struct gu_cfi *cfi, uint64_t pc,
 		if (!gu_cfi_ops_cacheable(ops_arr[i].ops_size))
 			return;
 
+	if (!cfi->parse_cache) {
+		cfi->parse_cache = calloc(GU_CFI_PARSE_CACHE_SIZE,
+					  sizeof(*cfi->parse_cache));
+		if (!cfi->parse_cache)
+			return;
+	}
 	entry = &cfi->parse_cache[gu_cfi_parse_cache_index(pc)];
 	memset(entry, 0, sizeof(*entry));
 	entry->valid = true;
@@ -1506,9 +1718,17 @@ int gu_cfi_parse_cfi_ex(struct gu_cfi *cfi, uint64_t pc, bool initial_frame,
 	if (ret < 0)
 		return -1;
 
-	struct gu_cfi_fde *fde = (struct gu_cfi_fde *)get_interval_array_pointer((uint64_t)item.private, NULL);
-	if (fde == NULL || fde->cie == NULL)
+	struct gu_cfi_fde_body *body = (struct gu_cfi_fde_body *)get_interval_array_pointer((uint64_t)item.private, NULL);
+	if (body == NULL || body->cie == NULL)
 		return -1;
+	struct gu_cfi_fde fde_view = {
+		.cie = body->cie,
+		.start = item.start,
+		.end = item.end,
+		.instructions = body->instructions,
+		.instructions_end = body->instructions_end,
+	};
+	struct gu_cfi_fde *fde = &fde_view;
 	if (signal_frame)
 		*signal_frame = fde->cie->signal_frame;
 

@@ -217,3 +217,14 @@ int gu_interval_array_search_set_no_free(struct interval_array *array, uint64_t 
 {
 	return __gu_interval_array_search(array, addr, item, true);
 }
+
+void gu_interval_array_set_private(struct interval_array *array, int index, void *private)
+{
+	if (!array || index < 0 || index >= array->count)
+		return;
+
+	if (array->type == INTERVAL_ARRAY_TYPE_U32)
+		array->items_u32[index].private = private;
+	else
+		array->items_u64[index].private = private;
+}

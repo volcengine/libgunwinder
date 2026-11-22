@@ -30,7 +30,7 @@ struct cfi_fixture {
 	struct gu_cfi cfi;
 	Elf_Data cfi_data;
 	struct gu_cfi_cie cie;
-	struct gu_cfi_fde fde;
+	struct gu_cfi_fde_body fde;
 	struct interval_array *intervals;
 };
 
@@ -133,8 +133,6 @@ static int init_cfi_fixture(struct cfi_fixture *cf, struct byte_builder *ins,
 	cf->cie.lsda_encoding = DW_EH_PE_omit;
 
 	cf->fde.cie = &cf->cie;
-	cf->fde.start = start;
-	cf->fde.end = end;
 	cf->fde.instructions = ins->data;
 	cf->fde.instructions_end = ins->data + ins->len;
 
@@ -164,7 +162,7 @@ static int init_bench_frame(struct bench_frame *frame, size_t idx)
 
 	memset(frame, 0, sizeof(*frame));
 	frame->raw_sp = 0x70000120ULL;
-	frame->stack_base = frame->raw_sp - (frame->raw_sp % (uint64_t)getpagesize());
+	frame->stack_base = frame->raw_sp & ~((uint64_t)GU_STACK_DATA_ALIGN - 1);
 	frame->pc = start + advance;
 	frame->expected_ra = 0x5555000000000000ULL + idx;
 	frame->expected_sp = frame->raw_sp + cfa_offset;

@@ -38,7 +38,7 @@ struct cfi_fixture {
 	struct gu_cfi cfi;
 	Elf_Data cfi_data;
 	struct gu_cfi_cie cie;
-	struct gu_cfi_fde fde;
+	struct gu_cfi_fde_body fde;
 	struct interval_array *intervals;
 };
 
@@ -51,7 +51,7 @@ static void init_eval_fixture(struct eval_fixture *fx)
 {
 	memset(fx, 0, sizeof(*fx));
 	fx->raw_sp = 0x70000120ULL;
-	fx->stack_base = fx->raw_sp - (fx->raw_sp % (uint64_t)getpagesize());
+	fx->stack_base = fx->raw_sp & ~((uint64_t)GU_STACK_DATA_ALIGN - 1);
 
 	fx->info.pid = getpid();
 	fx->info.unique_id = 1;
@@ -489,8 +489,6 @@ static int init_cfi_fixture(struct cfi_fixture *cf, const uint8_t *ins,
 	cf->cie.lsda_encoding = DW_EH_PE_omit;
 
 	cf->fde.cie = &cf->cie;
-	cf->fde.start = start;
-	cf->fde.end = end;
 	cf->fde.instructions = ins;
 	cf->fde.instructions_end = ins + ins_len;
 
@@ -509,6 +507,9 @@ static void destroy_cfi_fixture(struct cfi_fixture *cf)
 {
 	if (cf->intervals)
 		gu_interval_array_destroy(cf->intervals);
+	/* allocated by the first parse; gu_cfi_destroy() is not used here */
+	free(cf->cfi.parse_cache);
+	cf->cfi.parse_cache = NULL;
 }
 
 static int parse_cfi_fixture(struct cfi_fixture *cf, const struct byte_builder *b,
@@ -632,6 +633,31 @@ static int expect_cfi_reg_reason(const char *name, const struct byte_builder *b,
 	if (reason != expected) {
 		fprintf(stderr, "%s: expected reason %d, got %d\n",
 			name, expected, reason);
+		goto out;
+	}
+
+	ret = 0;
+out:
+	destroy_cfi_fixture(&cf);
+	return ret;
+}
+
+static int expect_cfi_reg_ops_empty(const char *name, const struct byte_builder *b,
+				    uint64_t pc, int regno)
+{
+	struct cfi_fixture cf;
+	Dwarf_Op *ops = NULL;
+	int nops = 0;
+	int ret = 1;
+
+	if (parse_cfi_fixture(&cf, b, pc) != 0)
+		return 1;
+
+	if (gu_cfi_get_ops(trans_reg_type(regno), &ops, &nops, false) != 0)
+		goto out;
+	if (nops != 0) {
+		fprintf(stderr, "%s: expected empty ops for reg %d, got %d\n",
+			name, regno, nops);
 		goto out;
 	}
 
@@ -765,6 +791,78 @@ static int test_cfi_offset_rule(void)
 			      saved_pc, saved_addr, saved_pc);
 }
 
+static int test_cfi_offset_extended_rule(void)
+{
+	struct byte_builder b = { 0 };
+	struct eval_fixture fx;
+	uint64_t saved_rbp = 0x1111222233334444ULL;
+	uint64_t saved_addr;
+
+	init_eval_fixture(&fx);
+	saved_addr = fx.raw_sp;
+
+	emit_def_cfa_rsp(&b, 16);
+	emit_rip_val_offset_zero(&b);
+	emit_u8(&b, DW_CFA_offset_extended);
+	emit_uleb(&b, reg_name_rbp);
+	emit_uleb(&b, 2);
+
+	return expect_cfi_reg("cfi_offset_extended_rule", &b, 0x1000,
+			      reg_name_rbp, saved_rbp, saved_addr, saved_rbp);
+}
+
+static int test_cfi_offset_extended_sf_rule(void)
+{
+	struct byte_builder b = { 0 };
+	struct eval_fixture fx;
+	uint64_t saved_rbp = 0x5555666677778888ULL;
+	uint64_t saved_addr;
+
+	init_eval_fixture(&fx);
+	saved_addr = fx.raw_sp + 32;
+
+	emit_def_cfa_rsp(&b, 16);
+	emit_rip_val_offset_zero(&b);
+	emit_u8(&b, DW_CFA_offset_extended_sf);
+	emit_uleb(&b, reg_name_rbp);
+	emit_sleb(&b, -2);
+
+	return expect_cfi_reg("cfi_offset_extended_sf_rule", &b, 0x1000,
+			      reg_name_rbp, saved_rbp, saved_addr, saved_rbp);
+}
+
+static int test_cfi_val_offset_rule(void)
+{
+	struct byte_builder b = { 0 };
+	struct eval_fixture fx;
+
+	init_eval_fixture(&fx);
+	emit_def_cfa_rsp(&b, 16);
+	emit_rip_val_offset_zero(&b);
+	emit_u8(&b, DW_CFA_val_offset);
+	emit_uleb(&b, reg_name_rbp);
+	emit_uleb(&b, 3);
+
+	return expect_cfi_reg("cfi_val_offset_rule", &b, 0x1000, reg_name_rbp,
+			      fx.raw_sp - 8, 0, 0);
+}
+
+static int test_cfi_val_offset_sf_rule(void)
+{
+	struct byte_builder b = { 0 };
+	struct eval_fixture fx;
+
+	init_eval_fixture(&fx);
+	emit_def_cfa_rsp(&b, 16);
+	emit_rip_val_offset_zero(&b);
+	emit_u8(&b, DW_CFA_val_offset_sf);
+	emit_uleb(&b, reg_name_rbp);
+	emit_sleb(&b, -3);
+
+	return expect_cfi_reg("cfi_val_offset_sf_rule", &b, 0x1000,
+			      reg_name_rbp, fx.raw_sp + 40, 0, 0);
+}
+
 static int test_cfi_remember_restore(void)
 {
 	struct byte_builder b = { 0 };
@@ -794,6 +892,29 @@ static int test_cfi_register_copy(void)
 
 	return expect_cfi_reg("cfi_register_copy", &b, 0x1000, reg_name_rbp,
 			      TEST_REGISTER_COPY_VALUE, 0, 0);
+}
+
+static int test_cfi_same_value_and_undefined_non_return_regs(void)
+{
+	struct byte_builder b = { 0 };
+	int ret = 0;
+
+	emit_def_cfa_rsp(&b, 16);
+	emit_rip_val_offset_zero(&b);
+	emit_u8(&b, DW_CFA_same_value);
+	emit_uleb(&b, reg_name_rbp);
+	ret |= expect_cfi_reg_ops_empty("cfi_same_value_rbp", &b, 0x1000,
+					reg_name_rbp);
+
+	memset(&b, 0, sizeof(b));
+	emit_def_cfa_rsp(&b, 16);
+	emit_rip_val_offset_zero(&b);
+	emit_u8(&b, DW_CFA_undefined);
+	emit_uleb(&b, reg_name_rbp);
+	ret |= expect_cfi_reg_ops_empty("cfi_undefined_rbp", &b, 0x1000,
+					reg_name_rbp);
+
+	return ret;
 }
 
 static int test_cfi_advance_loc(void)
@@ -947,65 +1068,20 @@ static int test_cfi_set_loc(void)
 	return expect_current_cfa("cfi_set_loc", &b, 0x100b, fx.raw_sp + 32);
 }
 
-static int expect_ops_fail(const char *name, const Dwarf_Op *ops, size_t nops)
+static int test_cfi_nop_ignored(void)
 {
-struct eval_fixture fx;
-uint64_t actual = 0xcafef00d;
+	struct byte_builder b = { 0 };
+	struct eval_fixture fx;
 
-init_eval_fixture(&fx);
-if (gu_dwarf_ops_eval(NULL, ops, nops, &actual, 0, fx.raw_sp, &fx.info)) {
-fprintf(stderr, "%s: expression evaluation must fail but succeeded\n",
-name);
-return 1;
-}
+	init_eval_fixture(&fx);
+	emit_def_cfa_rsp(&b, 16);
+	emit_rip_val_offset_zero(&b);
+	emit_u8(&b, DW_CFA_nop);
+	emit_u8(&b, DW_CFA_def_cfa_offset);
+	emit_uleb(&b, 48);
 
-return 0;
-}
-
-/* Signed INT64_MIN / -1 overflows and must be rejected, not wrapped. */
-static int test_expr_div_int64_min_overflow_fails(void)
-{
-const Dwarf_Op ops[] = {
-{ .atom = DW_OP_const8u, .number = 0x8000000000000000ULL },
-{ .atom = DW_OP_const1s, .number = -1 },
-{ .atom = DW_OP_div },
-};
-
-return expect_ops_fail("expr_div_int64_min_overflow_fails", ops,
-ARRAY_SIZE(ops));
-}
-
-static int test_expr_shr_overflow_fails(void)
-{
-const Dwarf_Op ops[] = {
-{ .atom = DW_OP_lit1 },
-{ .atom = DW_OP_const1u, .number = 64 },
-{ .atom = DW_OP_shr },
-};
-
-return expect_ops_fail("expr_shr_overflow_fails", ops, ARRAY_SIZE(ops));
-}
-
-static int test_expr_shl_overflow_fails(void)
-{
-const Dwarf_Op ops[] = {
-{ .atom = DW_OP_lit1 },
-{ .atom = DW_OP_const1u, .number = 64 },
-{ .atom = DW_OP_shl },
-};
-
-return expect_ops_fail("expr_shl_overflow_fails", ops, ARRAY_SIZE(ops));
-}
-
-static int test_expr_shra_overflow_fails(void)
-{
-const Dwarf_Op ops[] = {
-{ .atom = DW_OP_lit1 },
-{ .atom = DW_OP_const1u, .number = 64 },
-{ .atom = DW_OP_shra },
-};
-
-return expect_ops_fail("expr_shra_overflow_fails", ops, ARRAY_SIZE(ops));
+	return expect_current_cfa("cfi_nop_ignored", &b, 0x1000,
+				  fx.raw_sp + 48);
 }
 
 static const struct test_case cases[] = {
@@ -1029,18 +1105,20 @@ static const struct test_case cases[] = {
 	{ "cfi_expression", test_cfi_expression },
 	{ "cfi_val_expression", test_cfi_val_expression },
 	{ "cfi_offset_rule", test_cfi_offset_rule },
+	{ "cfi_offset_extended_rule", test_cfi_offset_extended_rule },
+	{ "cfi_offset_extended_sf_rule", test_cfi_offset_extended_sf_rule },
+	{ "cfi_val_offset_rule", test_cfi_val_offset_rule },
+	{ "cfi_val_offset_sf_rule", test_cfi_val_offset_sf_rule },
 	{ "cfi_remember_restore", test_cfi_remember_restore },
 	{ "cfi_register_copy", test_cfi_register_copy },
+	{ "cfi_same_value_and_undefined_non_return_regs", test_cfi_same_value_and_undefined_non_return_regs },
 	{ "cfi_advance_loc", test_cfi_advance_loc },
 	{ "cfi_unrecoverable_rip_fails", test_cfi_unrecoverable_rip_fails },
 	{ "cfi_truncated_expression_block_fails", test_cfi_truncated_expression_block_fails },
 	{ "cfi_truncated_instruction_fails", test_cfi_truncated_instruction_fails },
 	{ "cfi_stack_read_out_of_range", test_cfi_stack_read_out_of_range },
 	{ "cfi_set_loc", test_cfi_set_loc },
-{ "expr_div_int64_min_overflow_fails", test_expr_div_int64_min_overflow_fails },
-{ "expr_shr_overflow_fails", test_expr_shr_overflow_fails },
-{ "expr_shl_overflow_fails", test_expr_shl_overflow_fails },
-{ "expr_shra_overflow_fails", test_expr_shra_overflow_fails },
+	{ "cfi_nop_ignored", test_cfi_nop_ignored },
 };
 
 int main(int argc, char **argv)

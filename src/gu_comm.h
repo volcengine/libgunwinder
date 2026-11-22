@@ -7,6 +7,7 @@
 #include <openssl/md5.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 /**
  * enum GU_LOG_LEVEL - Log levels for internal use.
@@ -38,6 +39,24 @@ static inline int gu_is_verbose(void)
 	} while (0)
 
 void gu_set_verbose(int verbose);
+
+/*
+ * A message that can repeat for many processes: the first is printed,
+ * then at most one per interval, telling how many were dropped since.
+ * Driven by the events themselves, no timer.  Not locked: the caller
+ * serializes (a gu_context's limits are used under its lock).
+ */
+struct gu_log_limit {
+	uint64_t next_ns;	/* 0: nothing printed yet */
+	uint64_t suppressed;
+};
+
+/*
+ * Whether to print the event at @now_ns; if so, *@suppressed is the number
+ * of events dropped since the last one printed.
+ */
+bool gu_log_limit_allow(struct gu_log_limit *limit, uint64_t now_ns,
+			uint64_t interval_ns, uint64_t *suppressed);
 
 /**
  * gu_calculate_md5() - Calculate the MD5 hash of a file descriptor.
@@ -72,9 +91,9 @@ enum {
  * @permission: Memory permissions (combination of PERMISSION_* flags).
  * @deleted:    True if the pathname carried the " (deleted)" suffix in
  *              /proc/<pid>/maps, meaning the file was unlinked (and possibly
- *              replaced) after the process mapped it.  The stored path has
- *              the suffix stripped, so callers must not assume the on-disk
- *              file still matches the mapped bytes.
+ *              replaced) after the process mapped it.  The path stored in
+ *              @path has the suffix stripped, so callers must not assume the
+ *              on-disk file still matches the mapped bytes.
  */
 struct maps_info {
 	char *path;
@@ -95,6 +114,28 @@ struct maps_info {
  * Return: An array of mapping information, or NULL on error.
  */
 struct maps_info *gu_get_maps_info(int pid, int *count, char permission_flag, char *debug_maps);
+
+/**
+ * gu_get_pid_cmdline_argv0() - Read argv[0] from /proc/<pid>/cmdline.
+ * @pid:        Process ID to query.
+ * @argv0:      Output buffer.
+ * @argv0_size: Output buffer size.
+ *
+ * Only absolute paths are accepted. This helper is intentionally stricter than
+ * /proc/<pid>/exe fallback users because the hugepage text recovery path must
+ * use the launcher's original command line contract.
+ *
+ * Return: 0 on success, -1 on failure.
+ */
+int gu_get_pid_cmdline_argv0(int pid, char *argv0, size_t argv0_size);
+
+/**
+ * gu_maps_path_is_anonymous_exec_candidate() - Check maps path anonymity.
+ * @path: Path field parsed from /proc/<pid>/maps.
+ *
+ * Return: true if the path represents an anonymous executable mapping candidate.
+ */
+bool gu_maps_path_is_anonymous_exec_candidate(const char *path);
 
 /**
  * gu_free_maps_info() - Free memory mapping information array.

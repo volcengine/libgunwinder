@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: LGPL-3.0-or-later */
+
 /*
  * Copyright (C) 2026 ByteDance Inc.
  *
@@ -165,8 +166,7 @@ static bool read_addr(uint8_t *stack, uint64_t stack_start, uint64_t stack_end,
 static bool read_addr_from_info(struct gu_stack_info *info, uint64_t raw_sp,
 				uint64_t addr, uint64_t *val)
 {
-	uint64_t stack_page_size = getpagesize();
-	uint64_t stack_start = raw_sp - (raw_sp % stack_page_size);
+	uint64_t stack_start = raw_sp & ~((uint64_t)GU_STACK_DATA_ALIGN - 1);
 	uint64_t stack_end = stack_start + info->stack_size;
 
 	return read_addr(info->stack_data, stack_start, stack_end, raw_sp, addr,
@@ -272,7 +272,7 @@ bool gu_dwarf_ops_eval(Dwarf_Frame *frame, const Dwarf_Op *ops, size_t nops,
 
 	Dwarf_Addr val1, val2, val3;
 	bool is_location = false;
-	uint64_t stack_page_size = 0;
+	bool stack_window_set = false;
 	uint64_t stack_start = 0;
 	uint64_t stack_end = 0;
 	size_t steps_count = 0;
@@ -379,9 +379,9 @@ bool gu_dwarf_ops_eval(Dwarf_Frame *frame, const Dwarf_Op *ops, size_t nops,
 			if (op->atom == DW_OP_deref_size &&
 			    op->number > sizeof(Dwarf_Addr))
 				goto failed;
-			if (!stack_page_size) {
-				stack_page_size = getpagesize();
-				stack_start = raw_sp - (raw_sp % stack_page_size);
+			if (!stack_window_set) {
+				stack_window_set = true;
+				stack_start = raw_sp & ~((uint64_t)GU_STACK_DATA_ALIGN - 1);
 				stack_end = stack_start + info->stack_size;
 			}
 			if (!dw_pop(&dw_stack, &val1) ||
@@ -425,7 +425,6 @@ bool gu_dwarf_ops_eval(Dwarf_Frame *frame, const Dwarf_Op *ops, size_t nops,
 				goto failed;
 			if (val2 == 0)
 				goto failed;
-			/* Signed INT64_MIN / -1 overflows. */
 			if ((int64_t)val1 == INT64_MIN && (int64_t)val2 == -1)
 				goto failed;
 			if (!dw_push(&dw_stack, (int64_t)val1 / (int64_t)val2))
@@ -572,9 +571,9 @@ bool gu_dwarf_ops_eval(Dwarf_Frame *frame, const Dwarf_Op *ops, size_t nops,
 	if (!dw_pop(&dw_stack, result))
 		goto failed;
 	if (is_location) {
-		if (!stack_page_size) {
-			stack_page_size = getpagesize();
-			stack_start = raw_sp - (raw_sp % stack_page_size);
+		if (!stack_window_set) {
+			stack_window_set = true;
+			stack_start = raw_sp & ~((uint64_t)GU_STACK_DATA_ALIGN - 1);
 			stack_end = stack_start + info->stack_size;
 		}
 		if (!read_addr(info->stack_data, stack_start, stack_end, raw_sp, *result, result))

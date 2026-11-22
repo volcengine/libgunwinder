@@ -98,6 +98,14 @@ int gu_interval_array_search(struct interval_array *array, uint64_t addr, struct
  */
 int gu_interval_array_search_set_no_free(struct interval_array *array, uint64_t addr, struct interval_array_item *item);
 
+/*
+ * gu_interval_array_set_private() - Replace the private of an item.
+ * @array:   The interval array.
+ * @index:   The item, as a search returned it.
+ * @private: The new private, marked as the destroy should treat it.
+ */
+void gu_interval_array_set_private(struct interval_array *array, int index, void *private);
+
 /**
  * mark_interval_array_pointer_no_free() - Mark a payload pointer as externally owned.
  * @ptr_value: Pointer value to mark.

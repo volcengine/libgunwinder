@@ -21,6 +21,9 @@ struct gu_elf_exec_ranges {
 
 int gu_elf_exec_ranges_load_from_elf(Elf *elf,
 				     struct gu_elf_exec_ranges *ranges);
+int gu_elf_exec_ranges_load_fd(int fd, struct gu_elf_exec_ranges *ranges);
+/* Initialize libelf once per process; false if it cannot be. */
+bool gu_elf_init(void);
 int gu_elf_exec_ranges_load(const char *path,
 			    struct gu_elf_exec_ranges *ranges);
 void gu_elf_exec_ranges_destroy(struct gu_elf_exec_ranges *ranges);

@@ -6,9 +6,29 @@
 #include <fcntl.h>
 #include <gelf.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+static pthread_once_t elf_init_once = PTHREAD_ONCE_INIT;
+static bool elf_init_ok;
+
+static void elf_init(void)
+{
+	elf_init_ok = elf_version(EV_CURRENT) != EV_NONE;
+}
+
+/*
+ * elf_version() stores to process-global words on every call in some libelf
+ * versions: call it once, from gu_init() before any context is used, and
+ * never again from the paths contexts run concurrently.
+ */
+bool gu_elf_init(void)
+{
+	pthread_once(&elf_init_once, elf_init);
+	return elf_init_ok;
+}
 
 static unsigned long align_down(unsigned long value, unsigned long align)
 {
@@ -108,7 +128,6 @@ int gu_elf_exec_ranges_load(const char *path,
 			    struct gu_elf_exec_ranges *ranges)
 {
 	int fd = -1;
-	Elf *elf = NULL;
 	int ret = -1;
 
 	if (!path || !ranges)
@@ -116,11 +135,28 @@ int gu_elf_exec_ranges_load(const char *path,
 
 	memset(ranges, 0, sizeof(*ranges));
 
-	if (elf_version(EV_CURRENT) == EV_NONE)
-		return -1;
-
 	fd = open(path, O_RDONLY, 0);
 	if (fd < 0)
+		return -1;
+
+	ret = gu_elf_exec_ranges_load_fd(fd, ranges);
+
+	if (fd >= 0)
+		close(fd);
+	return ret;
+}
+
+int gu_elf_exec_ranges_load_fd(int fd, struct gu_elf_exec_ranges *ranges)
+{
+	Elf *elf = NULL;
+	int ret = -1;
+
+	if (fd < 0 || !ranges)
+		return -1;
+
+	memset(ranges, 0, sizeof(*ranges));
+
+	if (!gu_elf_init())
 		return -1;
 
 	elf = elf_begin(fd, ELF_C_READ, NULL);
@@ -132,8 +168,6 @@ int gu_elf_exec_ranges_load(const char *path,
 out:
 	if (elf)
 		elf_end(elf);
-	if (fd >= 0)
-		close(fd);
 	return ret;
 }
 

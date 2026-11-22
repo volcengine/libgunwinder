@@ -8,14 +8,43 @@
 #include <stdint.h>
 #include <sys/types.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /**
- * struct gu_elf_info - Public metadata for an ELF image.
- * @base_name: Base filename without the directory path.
- * @elf_file_path: Full path to the mapped ELF file.
- * @debug_file_path: Full path to the separate debug file, if any.
- * @build_id: Build ID bytes used for debug-file matching.
- * @build_id_len: Length of @build_id in bytes.
- * @golang: True when the image is detected as a Go binary.
+ * GU_STACK_DATA_ALIGN - Alignment of a stack snapshot's first byte.
+ *
+ * Contract between every stack producer and the unwinder: stack_data[0] of
+ * struct gu_stack_info is the byte at user address
+ * sp & ~(GU_STACK_DATA_ALIGN - 1), where sp is the stack pointer in
+ * gu_stack_info::regs, and stack_data[i] is the byte at that address + i.
+ * The value is fixed at 4096 on every architecture and host page size (the
+ * BPF producer copies the stack in 4 KiB chunks even on 64 KiB-page
+ * kernels); it is not the host page size.
+ */
+#define GU_STACK_DATA_ALIGN 4096
+
+/**
+ * struct gu_elf_info - Read-only view of a cached ELF file.
+ * @base_name:       File name without directories.
+ * @elf_file_path:   Host path the ELF was opened from, as seen by the first
+ *                   process that loaded it (entries are shared between
+ *                   processes): normally /proc/<pid>/root/<maps path>;
+ *                   /proc/<pid>/exe or /proc/<pid>/map_files/<range> for a
+ *                   deleted file; a local dump file for [vdso].
+ * @debug_file_path: File the symbols and CFI were read from: a separate
+ *                   debuginfo file found by GNU build-id (host first, then
+ *                   the target's root), otherwise the same as
+ *                   @elf_file_path.
+ * @build_id:        GNU or Go build-id bytes; when the ELF has none, the
+ *                   MD5 of the file head and name, used only as a cache key.
+ * @build_id_len:    Length of @build_id in bytes.
+ * @golang:          True if the ELF has a Go build-id note.
+ *
+ * Owned by the context; never write or free it.  It is the public prefix of
+ * the library's per-ELF cache entry, valid as long as that entry is (see
+ * struct gu_frame_record).
  */
 struct gu_elf_info {
 	char *base_name;
@@ -26,18 +55,38 @@ struct gu_elf_info {
 	bool golang;
 };
 
+/**
+ * enum gu_frame_flag - Bits of gu_frame_record::flags.
+ * @GU_FRAME_ANON_EXEC: The PC lies in an executable mapping that is not
+ *                      backed by an ELF (JIT code, for example): @elf_info
+ *                      and @symbol are NULL and @pc equals @abs_pc.
+ */
 enum gu_frame_flag {
 	GU_FRAME_ANON_EXEC = (1U << 0),
 };
 
 /**
- * struct gu_frame_record - Frame emitted by gu_unwind().
- * @pc: Program counter relative to the owning ELF load bias.
- * @abs_pc: Process virtual address before ELF load-bias normalization.
- * @offset: Offset from the start of @symbol.
- * @symbol: Symbol/function name, or NULL when unresolved.
- * @elf_info: ELF metadata associated with this frame.
- * @flags: Frame metadata, see gu_frame_flag.
+ * struct gu_frame_record - One unwound frame, passed to gu_frame_callback_t.
+ * @pc:       PC as an ELF virtual address (@abs_pc minus the load bias of
+ *            its mapping); equals @abs_pc for GU_FRAME_ANON_EXEC frames.
+ * @abs_pc:   PC as a virtual address of the target process.  For caller
+ *            frames this is the return address.
+ * @offset:   Offset of the symbol-lookup address from the start of @symbol,
+ *            0 when @symbol is NULL.  Caller frames look up @pc - 1 (inside
+ *            the call instruction), whether unwound by DWARF, by its
+ *            frame-pointer fallback or in GU_FLAG_HINT_SET_FP mode; the
+ *            first frame and signal frames look up @pc itself, and so does
+ *            a caller frame whose @pc - 1 is in no symbol while @pc starts
+ *            one (the sigreturn trampoline a signal handler returns into).
+ * @symbol:   Function name, or NULL when unknown.
+ * @elf_info: ELF that maps @pc, or NULL for GU_FRAME_ANON_EXEC frames.
+ * @flags:    See enum gu_frame_flag.
+ *
+ * The record itself is reused for every frame: it is valid only during the
+ * callback.  @symbol and @elf_info point into the context's ELF cache and
+ * stay valid until the next gu_unwind(), gu_preload_pid_debug_info(),
+ * gu_event_occur() or gu_cleanup() on the same context, any of which may
+ * evict unreferenced ELF entries.  Copy what must outlive that.
  */
 struct gu_frame_record {
 	uint64_t pc;
@@ -49,36 +98,75 @@ struct gu_frame_record {
 };
 
 /**
- * struct gu_init_cfg - Unwinder initialization configuration.
- * @debug_print: Enable debug output while initializing and unwinding.
- * @go_not_strip_name: Preserve full Go symbol names.
- * @go_buildid_only: Report Go frames by build ID and function entry only.
+ * struct gu_init_cfg - Configuration for gu_init(), copied by it.
+ * @debug_print:       OFFLINE REPLAY mode, not a log switch (logging is
+ *                     gu_set_verbose()).  For replaying dumps written by
+ *                     gu_debug_dump_sample() on another machine:
+ *                     gu_stack_info::unique_id is reinterpreted as a
+ *                     "const char *" path of a saved maps file, ELF paths are
+ *                     opened as is instead of under /proc/<pid>/root, and the
+ *                     process liveness and pid-reuse (unique_id) checks are
+ *                     skipped.  Must be false for live unwinding.
+ * @go_not_strip_name: Keep Go symbol names verbatim.  By default each package
+ *                     path component of a Go symbol is cut to its first
+ *                     character ("github.com/a/b.F" becomes "g/a/b.F").
+ * @go_buildid_only:   No longer supported: Go frames are always symbolized.
+ *                     gu_init() fails when it is set; it stays so that
+ *                     existing initializers that clear it still compile.
+ * @no_kernel_symbols: Neither load nor reload /proc/kallsyms: kernel
+ *                     addresses are resolved through another context
+ *                     (gu_search_kernel_symbol() is safe to call on any
+ *                     context from any thread).
  */
 struct gu_init_cfg {
 	bool debug_print;
 	bool go_not_strip_name;
 	bool go_buildid_only;
+	bool no_kernel_symbols;
 };
 
+/* Capacity of gu_stack_info::ustack_fp is MAX_FP_STACK_LEVEL + 1 entries. */
 #define MAX_FP_STACK_LEVEL (128 - 1)
 
 /**
- * struct gu_stack_info - Caller-provided stack snapshot.
- * @pid: Process ID for the sampled task.
- * @stack_size: Size of @stack_data in bytes.
- * @unique_id: Process-instance ID used to detect PID reuse.
- * @regs: Architecture-specific register block.
- * @regs_size: Size of @regs in bytes.
- * @flags: Unwind flags and encoded stop reason.
- * @ustack_fp: Optional user stack frame-pointer chain.
- * @ustack_fp_level: Number of valid entries in @ustack_fp.
- * @stack_data: Raw user stack bytes captured by the caller.
+ * struct gu_stack_info - One sampled user stack, input of gu_unwind().
+ * @pid:             Process id (tgid) the sample belongs to; selects the
+ *                   per-process cache and /proc/<pid> files.
+ * @tid:             The sampled thread of @pid, or 0.  Read instead of
+ *                   /proc/<pid> to load the process' mappings once its
+ *                   leader has exited before its other threads: the zombie
+ *                   leader has none left.
+ * @stack_size:      Number of valid bytes in @stack_data.
+ * @unique_id:       Identity of the process instance: the process start time
+ *                   (field 22 of /proc/<pid>/stat, in clock ticks), or 0 if
+ *                   unknown.  When it differs from the cached instance the
+ *                   pid was reused and the cache is rebuilt; 0 skips that
+ *                   check.  Offline replay mode reinterprets it, see
+ *                   gu_init_cfg::debug_print.
+ * @regs:            Register snapshot laid out as the build architecture's
+ *                   struct pt_regs: <asm/ptrace.h> on x86_64, the private
+ *                   definition in include/arch/arm64/arch.h on arm64.
+ *                   Required (non-NULL) in every mode.
+ * @regs_size:       Size of @regs in bytes.  Informational: the unwinder
+ *                   always accesses a full struct pt_regs.
+ * @flags:           Input hints (enum gu_unwind_flag, low bits) and the stop
+ *                   reason written back by gu_unwind() (enum
+ *                   gu_unwind_reason, bits 16..23, see gu_flags_reason()).
+ * @ustack_fp:       Return-address PCs of a frame-pointer walk, innermost
+ *                   first, with [0] the sampled instruction pointer.  These
+ *                   are code addresses, not frame pointers.  Used only with
+ *                   GU_FLAG_HINT_SET_FP.
+ * @ustack_fp_level: Number of valid entries in @ustack_fp; gu_unwind() uses
+ *                   at most MAX_FP_STACK_LEVEL of them.
+ * @stack_data:      Copy of the user stack starting at
+ *                   sp & ~(GU_STACK_DATA_ALIGN - 1), @stack_size bytes long.
  *
- * libgunwinder does not own @regs or @stack_data. They must remain valid until
- * gu_unwind() returns.
+ * The caller owns all buffers; the library keeps no reference after
+ * gu_unwind() returns.  gu_unwind() modifies @regs and @flags in place.
  */
 struct gu_stack_info {
 	pid_t pid;
+	pid_t tid;
 	size_t stack_size;
 	uint64_t unique_id;
 
@@ -94,9 +182,17 @@ struct gu_stack_info {
 };
 
 /**
- * enum gu_unwind_flag - Optional hints and controls for a stack snapshot.
- * @GU_FLAG_HINT_SET_FP: Use the frame-pointer unwind path when possible.
- * @GU_FLAG_FP_ALLOW_UNKNOWN: Keep executable frames without ELF backing.
+ * enum gu_unwind_flag - Input bits of gu_stack_info::flags.
+ * @GU_FLAG_HINT_SET_FP:      Do not unwind with DWARF: symbolize the PCs in
+ *                            gu_stack_info::ustack_fp instead.  gu_unwind()
+ *                            also sets this bit itself when the pid's main
+ *                            executable is a Go binary; it then applies from
+ *                            the next unwind of the same struct, so clear it
+ *                            when reusing a struct for another sample.
+ * @GU_FLAG_FP_ALLOW_UNKNOWN: With GU_FLAG_HINT_SET_FP, report PCs outside any
+ *                            known executable mapping as GU_FRAME_ANON_EXEC
+ *                            frames instead of stopping with
+ *                            GU_UNWIND_REASON_NO_EXEC_PC.
  */
 enum gu_unwind_flag {
 	GU_FLAG_HINT_SET_FP = (1ULL << 0),
@@ -109,9 +205,9 @@ enum gu_unwind_flag {
 };
 
 /**
- * gu_flags_set() - Set an unwind flag.
- * @info: Stack snapshot to update.
- * @flag: Flag to set.
+ * gu_flags_set() - Set an input flag in @info->flags.
+ * @info: The stack info.
+ * @flag: The flag to set.
  */
 static inline void gu_flags_set(struct gu_stack_info *info, enum gu_unwind_flag flag)
 {
@@ -119,9 +215,9 @@ static inline void gu_flags_set(struct gu_stack_info *info, enum gu_unwind_flag 
 }
 
 /**
- * gu_flags_clear() - Clear an unwind flag.
- * @info: Stack snapshot to update.
- * @flag: Flag to clear.
+ * gu_flags_clear() - Clear an input flag in @info->flags.
+ * @info: The stack info.
+ * @flag: The flag to clear.
  */
 static inline void gu_flags_clear(struct gu_stack_info *info, enum gu_unwind_flag flag)
 {
@@ -129,65 +225,52 @@ static inline void gu_flags_clear(struct gu_stack_info *info, enum gu_unwind_fla
 }
 
 /**
- * gu_flags_is_set() - Test whether an unwind flag is set.
- * @info: Stack snapshot to inspect.
- * @flag: Flag to test.
+ * gu_flags_is_set() - Test an input flag in @info->flags.
+ * @info: The stack info.
+ * @flag: The flag to test.
  *
- * Return: true if @flag is set, otherwise false.
+ * Return: True if @flag is set.
  */
 static inline bool gu_flags_is_set(const struct gu_stack_info *info, enum gu_unwind_flag flag)
 {
 	return !!(info->flags & flag);
 }
 
+/* The stop reason occupies bits 16..23 of gu_stack_info::flags. */
 #define GU_FLAG_REASON_SHIFT 16
 #define GU_FLAG_REASON_MASK (0xffULL << GU_FLAG_REASON_SHIFT)
 
 /**
- * enum gu_unwind_reason - Stop reason encoded in struct gu_stack_info::flags.
- * @GU_UNWIND_REASON_OK: Unwind completed successfully.
- * @GU_UNWIND_REASON_NO_REGS: No register context was provided.
- * @GU_UNWIND_REASON_NO_ELF: Executable ELF metadata was unavailable.
- * @GU_UNWIND_REASON_NO_CFI: CFI data was unavailable.
- * @GU_UNWIND_REASON_CFI_FAIL: CFI evaluation failed.
- * @GU_UNWIND_REASON_ARCH_FAIL: Architecture-specific register handling failed.
- * @GU_UNWIND_REASON_PROCESS_EXIT: Target process exited during unwinding.
- * @GU_UNWIND_REASON_LANG_SKIP: Language-specific unwinder skipped the frame.
- * @GU_UNWIND_REASON_TRUNCATED: Stack data was truncated.
- * @GU_UNWIND_REASON_NO_EXEC_PC: Program counter was outside executable ranges.
- * @GU_UNWIND_REASON_CFI_FRAME_DECODE_FAILED: FDE/CIE decode failed.
- * @GU_UNWIND_REASON_CFI_FRAME_CFA_FAILED: CFA rule was unavailable.
- * @GU_UNWIND_REASON_CFI_FRAME_CFA_CALC_FAILED: CFA expression evaluation failed.
- * @GU_UNWIND_REASON_END_OF_STACK: Reached a known stack-bottom frame.
- * @GU_UNWIND_REASON_STACK_READ_OUT_OF_RANGE: CFI read outside stack snapshot.
- * @GU_UNWIND_REASON_NO_PROGRESS: Next frame did not advance the stack (unwind loop).
- * @GU_UNWIND_REASON_UNKNOWN: Unclassified stop reason.
+ * enum gu_unwind_reason - Why gu_unwind() stopped, stored in flags bits 16..23.
+ *
+ * A successful gu_unwind() (return value >= 0) may still carry a failure
+ * reason: the frames delivered before the failure are valid.
  */
 enum gu_unwind_reason {
-	GU_UNWIND_REASON_OK = 0,
-	GU_UNWIND_REASON_NO_REGS,
-	GU_UNWIND_REASON_NO_ELF,
-	GU_UNWIND_REASON_NO_CFI,
-	GU_UNWIND_REASON_CFI_FAIL,
-	GU_UNWIND_REASON_ARCH_FAIL,
-	GU_UNWIND_REASON_PROCESS_EXIT,
-	GU_UNWIND_REASON_LANG_SKIP,
-	GU_UNWIND_REASON_TRUNCATED,
-	GU_UNWIND_REASON_NO_EXEC_PC,
-	GU_UNWIND_REASON_CFI_FRAME_DECODE_FAILED,
-	GU_UNWIND_REASON_CFI_FRAME_CFA_FAILED,
-	GU_UNWIND_REASON_CFI_FRAME_CFA_CALC_FAILED,
-	GU_UNWIND_REASON_END_OF_STACK,
-	GU_UNWIND_REASON_STACK_READ_OUT_OF_RANGE,
-	GU_UNWIND_REASON_NO_PROGRESS,
-	GU_UNWIND_REASON_UNKNOWN = 0xff,
+	GU_UNWIND_REASON_OK = 0, // No failure recorded (e.g. DWARF frame limit hit)
+	GU_UNWIND_REASON_NO_REGS, // gu_stack_info::regs is NULL
+	GU_UNWIND_REASON_NO_ELF, // No executable mapping known for the pid
+	GU_UNWIND_REASON_NO_CFI, // The current frame's ELF has no usable CFI
+	GU_UNWIND_REASON_CFI_FAIL, // Reserved, not set by the current implementation
+	GU_UNWIND_REASON_ARCH_FAIL, // Reserved, not set by the current implementation
+	GU_UNWIND_REASON_PROCESS_EXIT, // Process gone, or its maps could not be loaded
+	GU_UNWIND_REASON_LANG_SKIP, // Reserved, not set by the current implementation
+	GU_UNWIND_REASON_TRUNCATED, // Frame-pointer mode frame limit reached
+	GU_UNWIND_REASON_NO_EXEC_PC, // PC not in a known executable ELF mapping
+	GU_UNWIND_REASON_CFI_FRAME_DECODE_FAILED, // No CFI could be decoded for the PC
+	GU_UNWIND_REASON_CFI_FRAME_CFA_FAILED, // No CFI rule available for a register
+	GU_UNWIND_REASON_CFI_FRAME_CFA_CALC_FAILED, // Evaluating a CFI rule failed
+	GU_UNWIND_REASON_END_OF_STACK, // Reached a known stack bottom
+	GU_UNWIND_REASON_STACK_READ_OUT_OF_RANGE, // CFI needs stack bytes outside the dump
+	GU_UNWIND_REASON_NO_PROGRESS, // Next frame did not advance the stack pointer (unwind loop)
+	GU_UNWIND_REASON_UNKNOWN = 0xff, // Unknown failure
 };
 
 /**
- * gu_flags_reason() - Extract the encoded unwind stop reason.
- * @flags: Flags value from struct gu_stack_info.
+ * gu_flags_reason() - Extract the stop reason from gu_stack_info::flags.
+ * @flags: The flags field.
  *
- * Return: Unwind stop reason.
+ * Return: The reason stored in bits 16..23.
  */
 static inline enum gu_unwind_reason gu_flags_reason(uint64_t flags)
 {
@@ -195,9 +278,9 @@ static inline enum gu_unwind_reason gu_flags_reason(uint64_t flags)
 }
 
 /**
- * gu_flags_set_reason() - Store the unwind stop reason.
- * @info: Stack snapshot to update.
- * @reason: Stop reason to encode.
+ * gu_flags_set_reason() - Store a stop reason in @info->flags.
+ * @info:   The stack info.
+ * @reason: The reason to store; the input flag bits are preserved.
  */
 static inline void gu_flags_set_reason(struct gu_stack_info *info, enum gu_unwind_reason reason)
 {
@@ -206,9 +289,11 @@ static inline void gu_flags_set_reason(struct gu_stack_info *info, enum gu_unwin
 }
 
 /**
- * enum gu_event_type - External lifecycle events.
- * @GU_EVENT_PROCESS_EXIT: Target process exited and cached PID state is stale.
- * @GU_EVENT_MODULE_RELOAD: Target process module mappings should be reloaded.
+ * enum gu_event_type - Events for gu_event_occur().
+ * @GU_EVENT_PROCESS_EXIT:  A process exited.  Payload: a
+ *                          struct gu_process_exit_event *.
+ * @GU_EVENT_MODULE_RELOAD: Kernel modules changed: reload /proc/kallsyms.
+ *                          Payload: ignored, pass NULL.
  */
 enum gu_event_type {
 	GU_EVENT_PROCESS_EXIT,
@@ -216,39 +301,35 @@ enum gu_event_type {
 };
 
 /**
- * struct gu_statistics - Memory and cache statistics for a context.
- * @elf_ctx_count: Number of active ELF contexts.
- * @pid_ctx_count: Number of active PID contexts.
- * @elf_ctx_alloc_count: Total ELF context allocation count.
- * @pid_ctx_alloc_count: Total PID context allocation count.
- * @retired_elf_ctx_count: ELF contexts waiting for TTL cleanup.
- * @retired_elf_cache_hit: Zero-ref ELF contexts reused before TTL.
- * @retired_elf_expired: Retired ELF contexts expired by cache tick.
- * @pid_maps_reload_count: PID maps reloads caused by executable PC misses.
- * @pid_maps_reload_throttle_count: PC-miss reloads skipped by per-pid gate.
- * @symbols_mem_size: Bytes used by symbol metadata.
- * @cfi_mem_size: Bytes used by CFI metadata.
- * @cfi_data_mem_size: Bytes used by copied CFI instruction data.
- * @kernel_symbols_mem_size: Bytes used by kernel symbol metadata.
- * @unique_id_caused_reload_count: PID context reloads caused by unique_id changes.
+ * struct gu_statistics - Counters of one context, see gu_copy_statistics().
+ *
+ * Gauges ("active", "mem") reflect the current state; the other fields are
+ * cumulative since gu_init().
  */
 struct gu_statistics {
-	uint64_t elf_ctx_count;
-	uint64_t pid_ctx_count;
+	uint64_t elf_ctx_count; // Active ELF contexts
+	uint64_t pid_ctx_count; // Active PID contexts
 
-	uint64_t elf_ctx_alloc_count;
-	uint64_t pid_ctx_alloc_count;
-	uint64_t retired_elf_ctx_count;
-	uint64_t retired_elf_cache_hit;
-	uint64_t retired_elf_expired;
-	uint64_t pid_maps_reload_count;
-	uint64_t pid_maps_reload_throttle_count;
+	uint64_t elf_ctx_alloc_count; // Total ELF context allocations
+	uint64_t pid_ctx_alloc_count; // Total PID context allocations
+	uint64_t pid_ctx_swept_count; // PID contexts of gone processes reclaimed at high water
+	uint64_t retired_elf_ctx_count; // ELF contexts waiting for TTL cleanup
+	uint64_t retired_elf_cache_hit; // Zero-ref ELF contexts reused before TTL
+	uint64_t retired_elf_expired; // Retired ELF contexts expired by cache tick
+	uint64_t pid_maps_reload_count; // PID maps reloads caused by executable PC misses
+	uint64_t pid_maps_reload_throttle_count; // PC-miss reloads skipped by per-pid gate
+	uint64_t elf_file_cache_hit; // ELF loads served by file identity, not parsed
 
-	uint64_t symbols_mem_size;
-	uint64_t cfi_mem_size;
-	uint64_t cfi_data_mem_size;
-	uint64_t kernel_symbols_mem_size;
-	uint64_t unique_id_caused_reload_count;
+	uint64_t symbols_mem_size; // Memory used for symbols
+	uint64_t cfi_mem_size; // Memory used for CFI data
+	uint64_t cfi_data_mem_size; // Memory used for CFI instruction data
+	uint64_t kernel_symbols_mem_size; // Memory used for kernel symbols
+	uint64_t unique_id_caused_reload_count; // Number of times unique_id caused a reload of pid
+	uint64_t symbol_name_read_failures; // Symbol lookups whose compressed name did not decompress
 };
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* _GUNWINDER_TYPES_H */

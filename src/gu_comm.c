@@ -48,34 +48,59 @@ void __gu_log(enum GU_LOG_LEVEL level, const char *format, ...)
 	}
 
 	va_list args;
+	int len;
+
 	va_start(args, format);
-	vasprintf(&buffer, format, args);
+	len = vasprintf(&buffer, format, args);
 	va_end(args);
 
-	if (!buffer)
+	/* on failure the contents of the asprintf() result pointer are undefined */
+	if (len < 0)
 		return;
 
-	char *output_string;
+	/* every message is a line: OUTPUT ones end it unless they did */
+	if (level == GU_LOG_OUTPUT && (len == 0 || buffer[len - 1] != '\n'))
+		newline = true;
+
+	char *output_string = NULL;
 	if (newline)
-		asprintf(&output_string, "%s%s\n", prefix, buffer);
+		len = asprintf(&output_string, "%s%s\n", prefix, buffer);
 	else
-		asprintf(&output_string, "%s%s", prefix, buffer);
+		len = asprintf(&output_string, "%s%s", prefix, buffer);
 
 	free(buffer);
 
-	if (!output_string)
+	if (len < 0)
 		return;
 
+	/*
+	 * A message is out when this returns: stdout to journald is a pipe,
+	 * fully buffered, and the few messages left would wait there for hours
+	 * or until the process ends.
+	 */
 	if (g_print_fn)
 		g_print_fn(output_string);
+	else if (level == GU_LOG_ERROR)
+		fprintf(stderr, "%s", output_string);
 	else {
-		if (level == GU_LOG_ERROR)
-			fprintf(stderr, "%s", output_string);
-		else
-			printf("%s", output_string);
+		printf("%s", output_string);
+		fflush(stdout);
 	}
 
 	free(output_string);
+}
+
+bool gu_log_limit_allow(struct gu_log_limit *limit, uint64_t now_ns,
+			uint64_t interval_ns, uint64_t *suppressed)
+{
+	if (limit->next_ns && now_ns < limit->next_ns) {
+		limit->suppressed++;
+		return false;
+	}
+	*suppressed = limit->suppressed;
+	limit->suppressed = 0;
+	limit->next_ns = now_ns + interval_ns;
+	return true;
 }
 
 unsigned char *gu_calculate_md5(int fd, const char *name)
@@ -201,8 +226,9 @@ char *gu_path_join(const char *path1, const char *path2)
 }
 
 #define MAX_MAPS_PATH 4096
-static char maps_path[MAX_MAPS_PATH] = { 0 };
-static char maps_line[MAX_MAPS_PATH] = { 0 };
+/* line scratch of the maps parser; per thread, parsers run on several */
+static __thread char maps_path[MAX_MAPS_PATH];
+static __thread char maps_line[MAX_MAPS_PATH];
 
 struct maps_info *gu_get_maps_info(int pid, int *count, char permission_flag, char *debug_maps)
 {
@@ -257,11 +283,12 @@ struct maps_info *gu_get_maps_info(int pid, int *count, char permission_flag, ch
 		}
 
 		/*
-		 * Some executables expose one program header as several adjacent
-		 * /proc/maps VMAs.  Keep such adjacent pieces as one logical
-		 * mapping, but never merge across an address gap: a later
-		 * anonymous executable mapping with the same empty path must not
-		 * inherit the first ELF's bias or symbols.
+		 * Go binaries and tiexec-remapped text can expose one executable
+		 * program header as several adjacent /proc/maps VMAs.  The unwinder
+		 * computes one load bias per interval, so keep such adjacent pieces
+		 * as a single logical mapping.  Do not merge equal-looking mappings
+		 * across an address gap: a later anonymous/JIT mapping with the same
+		 * empty path must not inherit the first ELF's bias or symbols.
 		 */
 		if (index >= 1) {
 			uint64_t prev_size = info[index - 1].end - info[index - 1].start;
@@ -285,10 +312,12 @@ struct maps_info *gu_get_maps_info(int pid, int *count, char permission_flag, ch
 			goto fail;
 		}
 		/*
-		 * The " (deleted)" suffix in /proc/<pid>/maps marks a file unlinked
-		 * after being mapped.  sscanf() stops at the space, so record it here;
-		 * callers must read the live mapping (/proc/<pid>/exe or map_files)
-		 * rather than a possibly replaced file at the same pathname.
+		 * The " (deleted)" suffix in /proc/<pid>/maps marks a file that
+		 * was unlinked after being mapped.  sscanf() above stops at the
+		 * space, so the suffix is not part of maps_path.  Record it here
+		 * so callers can avoid opening a (possibly replaced) file at the
+		 * same pathname and instead read the live mapping through
+		 * /proc/<pid>/exe or /proc/<pid>/map_files/.
 		 */
 		info[index].deleted = strstr(maps_line, " (deleted)") != NULL;
 
@@ -319,6 +348,66 @@ fail:
 		fclose(fp);
 	*count = 0;
 	return NULL;
+}
+
+int gu_get_pid_cmdline_argv0(int pid, char *argv0, size_t argv0_size)
+{
+	char path[128];
+	int fd = -1;
+	ssize_t n = 0;
+	char *nul = NULL;
+	int ret = -1;
+
+	if (pid <= 0 || !argv0 || argv0_size == 0)
+		return -1;
+
+	argv0[0] = '\0';
+
+	if (snprintf(path, sizeof(path), "/proc/%d/cmdline", pid) < 0)
+		return -1;
+
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		goto out;
+
+	n = read(fd, argv0, argv0_size - 1);
+	if (n <= 0)
+		goto out;
+
+	nul = memchr(argv0, '\0', n);
+	if (nul) {
+		*nul = '\0';
+	} else {
+		if ((size_t)n >= argv0_size - 1)
+			goto out;
+		argv0[n] = '\0';
+	}
+
+	if (argv0[0] != '/')
+		goto out;
+
+	ret = 0;
+
+out:
+	if (ret != 0 && argv0_size > 0)
+		argv0[0] = '\0';
+	if (fd >= 0)
+		close(fd);
+	return ret;
+}
+
+bool gu_maps_path_is_anonymous_exec_candidate(const char *path)
+{
+	if (!path || path[0] == '\0')
+		return true;
+
+	/*
+	 * Newer kernels can name private anonymous VMAs. Treat only the named
+	 * anonymous forms as candidates; bracketed kernel pseudo mappings such as
+	 * [vdso] and [vsyscall] must stay on their existing paths.
+	 */
+	return strncmp(path, "[anon:", 6) == 0 ||
+	       strncmp(path, "[anon_shmem:", 12) == 0;
 }
 
 void gu_free_maps_info(struct maps_info *maps, int count)

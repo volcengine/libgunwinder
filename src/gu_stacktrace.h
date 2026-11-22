@@ -69,6 +69,21 @@ enum elf_scn_type {
  * @exec_ranges: Executable PT_LOAD ranges used for per-mapping bias.
  * @hh: uthash handle keyed by @build_id.
  */
+/*
+ * Identity of an opened ELF file.  A file with the same key has not changed
+ * since it was parsed, so its context is reused without parsing it again.
+ * Every member is 8 bytes: the key is hashed as raw bytes.
+ */
+struct gu_file_key {
+	uint64_t dev;
+	uint64_t ino;
+	int64_t size;
+	int64_t mtime_sec;
+	int64_t mtime_nsec;
+	int64_t ctime_sec;
+	int64_t ctime_nsec;
+};
+
 struct per_elf_ctx {
 	char *base_name;
 	char *elf_file_path;
@@ -88,8 +103,16 @@ struct per_elf_ctx {
 
 	int sym_scn;
 
+	/*
+	 * @symbols' items point to a name in @symbol_name_arena once it was
+	 * read, until then they hold its ordinal in @symbol_names: see
+	 * gu_elf_symbol_name().
+	 */
 	struct interval_array *symbols;
+	struct gu_symbol_names *symbol_names;
 	struct gu_symbol_name_arena_chunk *symbol_name_arena;
+	size_t symbol_name_arena_bytes;
+	uint64_t symbol_name_read_failures;
 	struct gu_cfi *gu_cfi;
 	struct gu_context *gu_ctx;
 
@@ -100,7 +123,12 @@ struct per_elf_ctx {
 	bool retired;
 	uint64_t retire_deadline_ns;
 
+	/* the file this context was parsed from, see load_elf() */
+	struct gu_file_key file_key;
+	bool file_indexed;
+
 	UT_hash_handle hh;
+	UT_hash_handle hh_file;
 };
 
 /**

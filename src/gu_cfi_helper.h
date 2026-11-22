@@ -41,6 +41,21 @@ struct gu_cfi_parse_cache_entry {
 	struct gu_cfi_cached_ops cfa;
 };
 
+/*
+ * The CFI of one ELF, built once at load and read-only afterwards.
+ *
+ * Every FDE is one item of @hdr_interval_array: the item holds the FDE's pc
+ * range and points to a gu_cfi_fde_body, the FDE's CIE and instructions.
+ * FDEs with the same CIE and instruction bytes share one body: a large C++
+ * binary has millions of FDEs but only a few percent distinct instruction
+ * sequences, and the instructions do not depend on where the FDE starts
+ * (advance_loc is relative to the start the item supplies).
+ *
+ * @cfi_data holds only the distinct instruction bytes: the CIEs' initial
+ * instructions and the bodies'.  A register rule given by an expression
+ * stores the expression's offset in @cfi_data.  The section itself is not
+ * kept after load.
+ */
 struct gu_cfi {
 	struct interval_array *hdr_interval_array;
 
@@ -57,11 +72,13 @@ struct gu_cfi {
 	unsigned long fde_count;
 	unsigned long eh_frame_p;
 
-	struct gu_cfi_fde *fdes;
+	struct gu_cfi_fde_body *bodies;
+	unsigned long body_count;
 
 	Elf_Data *cfi_data;
 
-	struct gu_cfi_parse_cache_entry parse_cache[GU_CFI_PARSE_CACHE_SIZE];
+	/* allocated by the first CFI lookup: most ELFs are never unwound */
+	struct gu_cfi_parse_cache_entry *parse_cache;
 };
 
 enum cfi_reg_type trans_reg_type(int regno);
@@ -124,6 +141,14 @@ struct gu_cfi_cie {
 	UT_hash_handle hh;
 };
 
+/* What FDEs with the same CIE and instructions share, see struct gu_cfi. */
+struct gu_cfi_fde_body {
+	struct gu_cfi_cie *cie;
+	const uint8_t *instructions;
+	const uint8_t *instructions_end;
+};
+
+/* One FDE as a lookup sees it: its range and its shared body. */
 struct gu_cfi_fde {
 	struct gu_cfi_cie *cie;
 
@@ -140,6 +165,16 @@ struct per_elf_ctx;
 struct gu_cfi *gu_cfi_init(struct per_elf_ctx *info);
 
 void gu_cfi_destroy(struct gu_cfi *cfi);
+
+/*
+ * Bytes of @cfi: cfi_mem_usage and cfi_data_mem_usage are fixed at load
+ * (the context's totals add and subtract them), the parse cache comes later.
+ */
+static inline unsigned long gu_cfi_runtime_mem_usage(const struct gu_cfi *cfi)
+{
+	return cfi->parse_cache ?
+		GU_CFI_PARSE_CACHE_SIZE * sizeof(*cfi->parse_cache) : 0;
+}
 
 int gu_cfi_parse_cfi(struct gu_cfi *cfi, uint64_t pc);
 int gu_cfi_parse_cfi_ex(struct gu_cfi *cfi, uint64_t pc, bool initial_frame,
