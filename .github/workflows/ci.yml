@@ -32,7 +32,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential clang libelf-dev libdw-dev libssl-dev \
+            build-essential clang binutils-dev libelf-dev libdw-dev libssl-dev \
             libiberty-dev libzstd-dev zlib1g-dev
 
       - name: Build
