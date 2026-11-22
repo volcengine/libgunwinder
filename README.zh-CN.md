@@ -49,7 +49,9 @@ Makefile 会根据当前架构选择 `include/arch/x86` 或 `include/arch/arm64`
 - elfutils 库：`libelf`、`libdw`
 - binutils 库：`libbfd`、`libiberty`
 - OpenSSL 库：`libssl`、`libcrypto`
+- zstd 库：`libzstd`（符号名在内存中压缩保存）
 - POSIX/Linux 系统头文件
+- Python 3 和 pytest，仅 `make tests` 需要
 
 ## 构建
 
@@ -100,7 +102,6 @@ void unwind_sample(pid_t pid, void *regs, uint32_t regs_size, uint8_t *stack, si
 	struct gu_init_cfg cfg = {
 		.debug_print = false,
 		.go_not_strip_name = false,
-		.go_buildid_only = false,
 	};
 	struct gu_context *ctx = gu_init(&cfg);
 	if (!ctx)
@@ -119,12 +120,20 @@ void unwind_sample(pid_t pid, void *regs, uint32_t regs_size, uint8_t *stack, si
 
 	gu_unwind(ctx, &info, on_frame, NULL);
 
-	gu_event_occur(ctx, GU_EVENT_PROCESS_EXIT, &pid);
+	struct gu_process_exit_event exit_event = {
+		.pid = pid,
+		.start_time = unique_id,
+	};
+	gu_event_occur(ctx, GU_EVENT_PROCESS_EXIT, &exit_event);
 	gu_cleanup(ctx);
 }
 ```
 
 `struct gu_stack_info` 中的寄存器和栈内存由调用方持有。libgunwinder 只会在 `gu_unwind()` 调用期间读取这些数据，不接管所有权。
+
+`unique_id` 标识进程实例：即进程的启动时间（单位为 clock tick），
+也就是 `/proc/<pid>/stat` 的第 22 个字段。如果样本的 `unique_id`
+与该 pid 下当前存活的进程不一致，libgunwinder 不会用新进程的映射去回溯它。
 
 ## 架构
 
@@ -155,31 +164,58 @@ gu_frame_callback_t
 `bin/bt_debug` 可回放 `gu_debug_dump_sample()` 生成的栈 dump：
 
 ```bash
-bin/bt_debug [-v|--verbose] <dump-file-or-directory>
+bin/bt_debug [-v|--verbose] [-q|--quiet] <dump-file-or-directory>
 ```
 
 做耗时测试时建议将普通输出重定向到文件，避免终端打印影响回溯耗时。
 
-## 验证
-
-仓库包含自包含的验证工具。它们生成合成输入，或使用调用方提供的 dump
-文件；不依赖私有测试数据或内部服务。
+`bin/bt_debug_minimize` 把随 dump 保存的 ELF 文件裁剪到回溯和符号化需要的
+section，便于分享 dump 而不带上二进制的其余部分：
 
 ```bash
-make clean all
-bin/cfi_stress
-bin/test_stable_fp_miss_reload
-bin/cfi_bench --frames 100000 --set-size 100 --warmup 1000
+bin/bt_debug_minimize --dump-dir DIR --out-dir DIR
+bin/bt_debug_minimize --elf FILE --out FILE
 ```
 
-- `cfi_stress` 覆盖 DWARF expression 和 CFI 边界场景。
-- `test_stable_fp_miss_reload` 检查 PID maps reload throttle 行为。
-- `cfi_bench` 是合成的 CFI parser/evaluator 微基准测试；它的输出适合作为
-  本机性能信号，不应直接等同为线上 workload 模型。
+## 验证
+
+仓库包含自包含的测试。它们生成合成输入，或在运行时编译小程序；不依赖私有
+测试数据或外部服务。
+
+```bash
+make tests
+```
+
+`make tests` 先运行 `bin/` 下的独立测试工具，再运行 `tests/` 下按用例组织的
+测试（pytest），覆盖 CFI 解码与去重、符号名压缩、进程身份与 maps 重载、ELF
+缓存、调用者帧查找、大页代码段恢复、日志以及调试 dump 工具。CI 在 x86_64 和
+arm64 上分别用 gcc、clang 运行，并额外用 AddressSanitizer 和
+UndefinedBehaviorSanitizer 跑一遍。
+
+`bin/cfi_bench --frames 100000 --set-size 100 --warmup 1000` 是合成的 CFI
+parser/evaluator 微基准测试；它的输出适合作为本机性能信号，不应直接等同为
+线上 workload 模型。
 
 ## 并发约束
 
-`struct gu_context` 持有可变缓存。调用 `gu_unwind()`、`gu_preload_pid_debug_info()`、`gu_event_occur()` 以及缓存相关接口时，应对同一个 context 做外部串行化。如果不同线程需要独立无锁回溯，请使用不同的 context。
+每个 `struct gu_context` 有自己的互斥锁，所有以 context 为参数的调用都会持有
+它，因此同一个 context 上的调用是串行的。不同 context 之间除了少数文档列出的
+进程级状态（内核符号、pid context 监听器注册表、libelf 初始化和日志钩子）外不
+共享可变状态，所以不同 context 可以各用一个线程并发回溯。完整模型见
+[`include/gunwinder/unwinder.h`](include/gunwinder/unwinder.h) 开头的说明。
+
+## 2.0 的变化
+
+2.0 有以下不兼容的 API 变化，已有调用方需要相应修改：
+
+- `GU_EVENT_PROCESS_EXIT` 的参数改为 `struct gu_process_exit_event *`（pid 和
+  进程实例的启动时间），不再是 `int *`。
+- 不再支持 `gu_init_cfg::go_buildid_only`：设置后 `gu_init()` 返回失败。
+- `gu_stack_info` 新增 `tid`（被采样的线程），用于读取 leader 已经退出的进程。
+  请把结构体整体清零后再填写。
+- `gu_copy_statistics()` 在 context 锁内复制计数；`gu_get_statistics()` 只保留给
+  单线程调用方。
+- 链接需要 `-lzstd`。
 
 ## 文档链接
 

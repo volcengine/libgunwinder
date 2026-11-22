@@ -49,7 +49,9 @@ Build-time and link-time dependencies:
 - elfutils libraries: `libelf` and `libdw`
 - binutils libraries: `libbfd` and `libiberty`
 - OpenSSL libraries: `libssl` and `libcrypto`
+- zstd library: `libzstd` (symbol names are kept compressed in memory)
 - POSIX/Linux system headers
+- Python 3 with pytest, for `make tests` only
 
 ## Build
 
@@ -100,7 +102,6 @@ void unwind_sample(pid_t pid, void *regs, uint32_t regs_size, uint8_t *stack, si
 	struct gu_init_cfg cfg = {
 		.debug_print = false,
 		.go_not_strip_name = false,
-		.go_buildid_only = false,
 	};
 	struct gu_context *ctx = gu_init(&cfg);
 	if (!ctx)
@@ -119,12 +120,20 @@ void unwind_sample(pid_t pid, void *regs, uint32_t regs_size, uint8_t *stack, si
 
 	gu_unwind(ctx, &info, on_frame, NULL);
 
-	gu_event_occur(ctx, GU_EVENT_PROCESS_EXIT, &pid);
+	struct gu_process_exit_event exit_event = {
+		.pid = pid,
+		.start_time = unique_id,
+	};
+	gu_event_occur(ctx, GU_EVENT_PROCESS_EXIT, &exit_event);
 	gu_cleanup(ctx);
 }
 ```
 
 Callers own the register and stack buffers passed through `struct gu_stack_info`. libgunwinder reads them during `gu_unwind()` and does not take ownership.
+
+`unique_id` identifies the process instance: its start time in clock ticks,
+field 22 of `/proc/<pid>/stat`. A sample whose `unique_id` differs from the
+live process under that pid is not unwound against the new process.
 
 ## Architecture
 
@@ -155,32 +164,64 @@ The main public entry points are declared in [`include/gunwinder/unwinder.h`](in
 `bin/bt_debug` replays stack dump files created by `gu_debug_dump_sample()`:
 
 ```bash
-bin/bt_debug [-v|--verbose] <dump-file-or-directory>
+bin/bt_debug [-v|--verbose] [-q|--quiet] <dump-file-or-directory>
 ```
 
 For timing-oriented runs, redirect normal output to a file so terminal printing does not dominate measured unwind time.
 
-## Validation
-
-The repository includes self-contained validation tools. They generate synthetic
-inputs or use caller-provided dump files; no private test data or internal
-services are required.
+`bin/bt_debug_minimize` shrinks the ELF files saved with a dump to the
+sections unwinding and symbolization need, so a dump can be shared without
+the rest of the binaries:
 
 ```bash
-make clean all
-bin/cfi_stress
-bin/test_stable_fp_miss_reload
-bin/cfi_bench --frames 100000 --set-size 100 --warmup 1000
+bin/bt_debug_minimize --dump-dir DIR --out-dir DIR
+bin/bt_debug_minimize --elf FILE --out FILE
 ```
 
-- `cfi_stress` covers DWARF expression and CFI edge cases.
-- `test_stable_fp_miss_reload` checks PID map reload throttling behavior.
-- `cfi_bench` is a synthetic CFI parser/evaluator microbenchmark. Treat its
-  output as a local performance signal rather than a production workload model.
+## Validation
+
+The repository includes self-contained tests. They generate synthetic inputs
+or compile small programs at run time; no private test data or services are
+required.
+
+```bash
+make tests
+```
+
+`make tests` runs the standalone test tools under `bin/` and then the
+case-driven tests under `tests/` (pytest), which cover CFI decoding and
+deduplication, compressed symbol names, process identity and maps reloads,
+the ELF cache, caller-frame lookup, hugepage text recovery, logging and the
+debug dump tools. The CI workflow runs it on x86_64 and arm64 with gcc and
+clang, and once more with AddressSanitizer and UndefinedBehaviorSanitizer.
+
+`bin/cfi_bench --frames 100000 --set-size 100 --warmup 1000` is a synthetic
+CFI parser/evaluator microbenchmark. Treat its output as a local performance
+signal rather than a production workload model.
 
 ## Concurrency
 
-`struct gu_context` owns mutable caches. Serialize access to a context when calling `gu_unwind()`, `gu_preload_pid_debug_info()`, `gu_event_occur()`, and cache-related accessors. Use separate contexts if independent threads need to unwind without external locking.
+Each `struct gu_context` has its own mutex, and every call taking a context
+holds it, so calls on one context are serialized. Separate contexts share
+nothing mutable except a few documented process-wide items (kernel symbols,
+the pid-context listener registry, the libelf initialization and the log
+hooks), so different contexts can unwind concurrently, one thread each. The
+full model is documented at the top of
+[`include/gunwinder/unwinder.h`](include/gunwinder/unwinder.h).
+
+## Changes in 2.0
+
+2.0 changes the API in ways an existing caller must follow:
+
+- `GU_EVENT_PROCESS_EXIT` takes a `struct gu_process_exit_event *` (pid and
+  the instance's start time) instead of an `int *`.
+- `gu_init_cfg::go_buildid_only` is no longer supported: `gu_init()` fails
+  when it is set.
+- `gu_stack_info` gained `tid`, the sampled thread, which is used to read a
+  process whose leader has already exited. Zero-initialize the struct.
+- `gu_copy_statistics()` copies the counters under the context lock;
+  `gu_get_statistics()` is kept for single-threaded callers.
+- Linking needs `-lzstd`.
 
 ## Documentation Links
 
