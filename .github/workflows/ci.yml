@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.arch }} ${{ matrix.cc }}${{ matrix.sanitize && ' sanitize' || '' }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-24.04, cc: gcc }
+          - { arch: x86_64, runner: ubuntu-24.04, cc: clang }
+          - { arch: x86_64, runner: ubuntu-24.04, cc: gcc, sanitize: true }
+          - { arch: arm64, runner: ubuntu-24.04-arm, cc: gcc }
+          - { arch: arm64, runner: ubuntu-24.04-arm, cc: clang }
+          - { arch: arm64, runner: ubuntu-24.04-arm, cc: gcc, sanitize: true }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang libelf-dev libdw-dev libssl-dev \
+            libiberty-dev libzstd-dev zlib1g-dev
+
+      - name: Build
+        run: |
+          if [ "${{ matrix.sanitize }}" = "true" ]; then
+            make -j"$(nproc)" CC=${{ matrix.cc }} \
+              CFLAGS_OPT="-O1 -g -fno-omit-frame-pointer" \
+              DEBUG_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=undefined"
+          else
+            make -j"$(nproc)" CC=${{ matrix.cc }}
+          fi
+
+      - name: Test
+        run: |
+          if [ "${{ matrix.sanitize }}" = "true" ]; then
+            make tests CC=${{ matrix.cc }} \
+              CFLAGS_OPT="-O1 -g -fno-omit-frame-pointer" \
+              DEBUG_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=undefined"
+          else
+            make tests CC=${{ matrix.cc }}
+          fi

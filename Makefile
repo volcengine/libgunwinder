@@ -38,15 +38,21 @@ SHARED_LIB = lib/libgunwinder.so
 
 all: $(STATIC_LIB) $(SHARED_LIB) $(TOOL_BINS)
 
-tests: all
-	$(Q)bin/test_zero_size_func_lookup
-	$(Q)bin/cfi_stress
-	$(Q)bin/test_symbol_resolution
+TEST_BINS = bin/test_zero_size_func_lookup bin/cfi_stress \
+	bin/test_symbol_resolution bin/test_stable_fp_miss_reload
 
-obj/%.o: src/%.c
+# Every test tool, one after another; the first failure stops the run.
+tests: all
+	$(Q)set -e; for t in $(TEST_BINS); do echo "  TEST    $$t"; $$t; done
+
+# -MMD: an object also depends on the headers it includes, so a changed
+# struct rebuilds every object that lays it out.
+obj/%.o: src/%.c Makefile
 	@mkdir -p $(dir $@)
 	$(Q)echo "  CC      $@"
-	$(Q)$(CC) $(CFLAGS_common) -c $< -o $@
+	$(Q)$(CC) $(CFLAGS_common) -MMD -MP -c $< -o $@
+
+-include $(OBJS:.o=.d)
 
 $(STATIC_LIB): $(OBJS) Makefile
 	@mkdir -p $(dir $@)
