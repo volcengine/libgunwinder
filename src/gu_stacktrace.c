@@ -3593,6 +3593,7 @@ static int gu_unwind_locked(struct gu_context *ctx, struct gu_stack_info *info,
 
 	raw_sp = sp;
 	prev_sp = sp;
+	prev_pc = pc;
 
 	int max_backtrace_level = 512;
 
@@ -3718,8 +3719,13 @@ static int gu_unwind_locked(struct gu_context *ctx, struct gu_stack_info *info,
 		 * while SP still creeps upward - an endless run of identical
 		 * "0x... [libc.so.6]" frames up to the depth cap. Stop as soon
 		 * as the stack fails to make forward progress in either SP or PC.
+		 *
+		 * The one step that may keep SP is the one out of the sampled
+		 * frame: a leaf that saved nothing (arm64, where a call leaves
+		 * the return address in x30 and moves no stack) returns to its
+		 * caller with the same SP.  The PC must still change.
 		 */
-		if (sp <= prev_sp || pc == prev_pc) {
+		if (sp < prev_sp || (sp == prev_sp && !initial_frame) || pc == prev_pc) {
 			reason = GU_UNWIND_REASON_NO_PROGRESS;
 			break;
 		}

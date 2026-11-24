@@ -4,6 +4,8 @@
  *   1. symbols load from .gnu_debuglink separate debuginfo
  *   2. deleted/replaced executables resolve through /proc/<pid>/exe
  *   3. symbols load even when the ELF carries no .eh_frame CFI table
+ *   4. the caller of a leaf that saved nothing (arm64 at -O2: the return
+ *      address is in x30 and SP does not move) is not lost
  *
  * The test compiles a small workload at runtime, drives it with ptrace,
  * and feeds a real register/stack snapshot into the public unwind API.
@@ -239,7 +241,7 @@ static void reap_child(pid_t pid)
 	waitpid(pid, NULL, 0);
 }
 
-static int stop_and_unwind(const char *bin)
+static int stop_and_unwind_ex(const char *bin, int need_mid)
 {
 	pid_t pid = spawn_workload(bin);
 	struct symbol_hits hits = { 0 };
@@ -253,14 +255,65 @@ static int stop_and_unwind(const char *bin)
 		fprintf(stderr, "%s: hot_leaf frame was not symbolized\n", bin);
 		rc = 1;
 	}
-	if (rc == 0 && !hits.hot_mid)
+	if (rc == 0 && !hits.hot_mid && need_mid) {
+		fprintf(stderr, "%s: hot_mid, the caller of the leaf, was lost\n", bin);
+		rc = 1;
+	} else if (rc == 0 && !hits.hot_mid) {
 		fprintf(stderr, "%s: note: hot_mid frame not seen (unwind depth)\n",
 			bin);
+	}
 	if (rc)
 		fprintf(stderr, "stop_and_unwind(%s) FAILED\n", bin);
 
 	reap_child(pid);
 	return rc;
+}
+
+static int stop_and_unwind(const char *bin)
+{
+	return stop_and_unwind_ex(bin, 0);
+}
+
+/*
+ * hot_leaf at -O2 saves no frame record: on arm64 its return address is
+ * only in x30 and its SP is the caller's.  The step out of it keeps SP, and
+ * the walk must still go on to hot_mid.  A few stops, so the leaf is caught
+ * past its first instruction too.
+ */
+static int scenario_frameless_leaf(const char *dir)
+{
+	char src[PATH_MAX], bin[PATH_MAX];
+	char cmd[PATH_MAX * 3];
+
+	snprintf(src, sizeof(src), "%s/work.c", dir);
+	snprintf(bin, sizeof(bin), "%s/work_o2", dir);
+	if (write_workload_source(src) != 0)
+		return 1;
+	/* no tail call: hot_mid must stay on the stack */
+	snprintf(cmd, sizeof(cmd), "cc -O2 -fno-optimize-sibling-calls -g -o %s %s", bin, src);
+	if (run_cmd(cmd) != 0) {
+		fprintf(stderr, "frameless leaf workload build failed\n");
+		return 1;
+	}
+	for (int i = 0; i < 5; i++) {
+#ifdef __aarch64__
+		int need_mid = 1;
+#else
+		/*
+		 * x86: a call always pushes the return address, so the step out
+		 * of the leaf moves SP and the guard is not involved; this
+		 * harness's snapshot stops after the leaf there in every
+		 * scenario (their "note" lines).
+		 */
+		int need_mid = 0;
+#endif
+		if (stop_and_unwind_ex(bin, need_mid) != 0) {
+			fprintf(stderr, "scenario_frameless_leaf FAILED\n");
+			return 1;
+		}
+	}
+	printf("frameless leaf caller ok\n");
+	return 0;
 }
 
 static int scenario_debuglink(const char *dir)
@@ -375,6 +428,7 @@ int main(void)
 	failures += scenario_debuglink(dir);
 	failures += scenario_deleted(dir);
 	failures += scenario_no_cfi(dir);
+	failures += scenario_frameless_leaf(dir);
 
 	if (failures)
 		fprintf(stderr, "%d symbol resolution scenario(s) failed\n",
